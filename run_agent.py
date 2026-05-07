@@ -9999,6 +9999,11 @@ class AIAgent:
                 function_name, function_args, effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=self.session_id or "",
+                platform=self.platform or "",
+                chat_id=self._chat_id or "",
+                thread_id=self._thread_id or "",
+                user_id=self._user_id or "",
+                user_task=getattr(self, "_current_user_message_for_tools", ""),
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
             )
@@ -10710,6 +10715,11 @@ class AIAgent:
                         function_name, function_args, effective_task_id,
                         tool_call_id=tool_call.id,
                         session_id=self.session_id or "",
+                        platform=self.platform or "",
+                        chat_id=self._chat_id or "",
+                        thread_id=self._thread_id or "",
+                        user_id=self._user_id or "",
+                        user_task=getattr(self, "_current_user_message_for_tools", ""),
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
                     )
@@ -10730,6 +10740,11 @@ class AIAgent:
                         function_name, function_args, effective_task_id,
                         tool_call_id=tool_call.id,
                         session_id=self.session_id or "",
+                        platform=self.platform or "",
+                        chat_id=self._chat_id or "",
+                        thread_id=self._thread_id or "",
+                        user_id=self._user_id or "",
+                        user_task=getattr(self, "_current_user_message_for_tools", ""),
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
                     )
@@ -11138,6 +11153,7 @@ class AIAgent:
             user_message = _sanitize_surrogates(user_message)
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
+        self._current_user_message_for_tools = str(user_message or "")[:4000]
 
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
