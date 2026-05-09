@@ -92,6 +92,17 @@ def discord_triggering_note(message_id: Any) -> str:
     )
 
 
+def discord_reply_fetch_hint(event: Any, source: Any) -> str:
+    """LOCAL CARRY: model-facing pointer to fetch the replied-to message's surroundings.
+    Anchored on the channel the referenced message lives in (thread vs parent)."""
+    ref_chan = getattr(event, "reply_to_channel_id", None) or getattr(source, "chat_id", None)
+    return (
+        f"[For the full replied-to message or surrounding context, call "
+        f"discord(action='fetch_messages', channel_id='{ref_chan}', "
+        f"around='{event.reply_to_message_id}', limit=20).]"
+    )
+
+
 def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     """Authored text for the durable user row: peel off exactly the note
     ``_prepend_inbound_reply_context`` added for THIS event, if present. The note is a
@@ -101,6 +112,11 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     message_id = getattr(event, "message_id", None)
     if not message_id or not isinstance(message_text, str):
         return message_text
+    if getattr(event, "reply_to_message_id", None):
+        # LOCAL CARRY: the reply fetch hint rides as a suffix of the model text.
+        hint = f"\n\n{discord_reply_fetch_hint(event, getattr(event, 'source', None))}"
+        if message_text.endswith(hint):
+            message_text = message_text[: -len(hint)]
     prefix = f"{discord_triggering_note(message_id)}\n\n"
     return message_text[len(prefix):] if message_text.startswith(prefix) else message_text
 
@@ -1647,6 +1663,11 @@ class GatewayInboundMixin:
             from gateway.session import _discord_tools_loaded as _disc_tools_loaded
             if _disc_tools_loaded():
                 message_text = f"{discord_triggering_note(event.message_id)}\n\n{message_text}"
+                # LOCAL CARRY: fetch hint for the REPLIED-TO message, model-only like the note.
+                # Appended as a suffix so the upstream prefix layout stays byte-identical;
+                # strip_discord_triggering_note peels it off the durable row.
+                if event.reply_to_message_id:
+                    message_text = f"{message_text}\n\n{discord_reply_fetch_hint(event, source)}"
         return message_text
 
     async def _inbound_model_context_length(self, source: SessionSource, session_key: str) -> int:

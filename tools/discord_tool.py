@@ -334,12 +334,22 @@ def _search_members(token: str, guild_id: str, query: str, limit: int = 20, **_k
 
 def _fetch_messages(
     token: str, channel_id: str, limit: int = 50,
-    before: Optional[str] = None, after: Optional[str] = None, **_kwargs: Any) -> str:
-    """``before``/``after`` are message snowflakes for reverse/forward pagination."""
+    before: Optional[str] = None, after: Optional[str] = None,
+    around: Optional[str] = None,
+    **_kwargs: Any) -> str:
+    """``before``/``after`` are message snowflakes for reverse/forward pagination.
+
+    LOCAL CARRY: ``around`` returns messages centered on a specific snowflake —
+    used when the agent has a replied-to ``message_id`` and wants the
+    surrounding context. Discord rejects anchor combinations, so the most
+    specific anchor wins.
+    """
     params: Dict[str, str] = {"limit": _limit_param(limit, 50)}
-    if before:
+    if around:
+        params["around"] = around
+    elif before:
         params["before"] = before
-    if after:
+    elif after:
         params["after"] = after
     messages = _discord_request("GET", f"/channels/{channel_id}/messages", token, params=params)
     return _listing("messages", [_message_summary(msg) for msg in messages])
@@ -399,7 +409,7 @@ _ACTION_MANIFEST = [
     ("list_roles", _list_roles, "(guild_id)", "roles sorted by position"),
     ("member_info", _member_info, "(guild_id, user_id)", "lookup a specific member"),
     ("search_members", _search_members, "(guild_id, query)", "find members by name prefix"),
-    ("fetch_messages", _fetch_messages, "(channel_id)", "recent messages; optional before/after snowflakes"),
+    ("fetch_messages", _fetch_messages, "(channel_id)", "recent messages; optional around/before/after snowflakes"),
     ("list_pins", _list_pins, "(channel_id)", "pinned messages in a channel"),
     ("pin_message", _pin_message, "(channel_id, message_id)", "pin a message"),
     ("unpin_message", _unpin_message, "(channel_id, message_id)", "unpin a message"),
@@ -488,6 +498,14 @@ _SCHEMA_PROPERTIES: Dict[str, Any] = {
     },
     "before": {"type": "string", "description": "Snowflake ID for reverse pagination (fetch_messages)."},
     "after": {"type": "string", "description": "Snowflake ID for forward pagination (fetch_messages)."},
+    "around": {
+        "type": "string",
+        "description": (
+            "Snowflake ID to anchor a fetch_messages call. Returns ~limit/2 messages before "
+            "and after this message_id. Use this to pull context around a replied-to message — "
+            "pass the reply_to message_id from the user's message."
+        ),
+    },
     "auto_archive_duration": {
         "type": "integer",
         "enum": [60, 1440, 4320, 10080],
@@ -581,7 +599,7 @@ def check_discord_tool_requirements() -> bool:
 # ── handlers ─────────────────────────────────────────────────────────────────
 _HANDLER_DEFAULTS = {
     "guild_id": "", "channel_id": "", "user_id": "", "role_id": "", "message_id": "", "query": "",
-    "name": "", "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440}
+    "name": "", "limit": 50, "before": "", "after": "", "around": "", "auto_archive_duration": 1440}
 
 
 def _run_discord_action(action: str, valid_actions: Dict[str, Any], tool_label: str, **params: Any) -> str:
