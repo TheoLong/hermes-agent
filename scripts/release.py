@@ -64,6 +64,7 @@ AUTHOR_MAP = {
     "ytchen0719@gmail.com": "liquidchen",
     "am@studio1.tailb672fe.ts.net": "subtract0",
     "axmaiqiu@gmail.com": "qWaitCrypto",
+    "264291321+v1b3coder@users.noreply.github.com": "v1b3coder",
     "maksesipov@gmail.com": "Qwinty",
     "denisamania@gmail.com": "CalmProton",
     "308068+mbac@users.noreply.github.com": "mbac",
