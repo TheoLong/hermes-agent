@@ -1514,7 +1514,21 @@ class GatewayInboundMixin:
             # A preview here silently loses later list items and code; keep that context intact.
             reply_text = event.reply_to_text
             _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
-            message_text = f'[Replying to{_who}: "{reply_text}"]\n\n{message_text}'
+            pointer = f'[Replying to{_who}: "{reply_text}"]'
+            # LOCAL CARRY: active-fetch hint appended as a separate line so the
+            # base pointer above stays byte-identical to upstream. Carries the
+            # channel + message snowflake of the REPLIED-TO message so the agent
+            # can pull its neighbours via the discord tool's around= anchor
+            # (the triggering-message id injected above anchors a different
+            # message — the user's reply, not the thing replied to).
+            ref_chan = getattr(event, "reply_to_channel_id", None) or getattr(source, "chat_id", None)
+            ref_msg = event.reply_to_message_id
+            fetch_hint = (
+                f"\n[For the full message or surrounding context, call "
+                f"discord(action='fetch_messages', channel_id='{ref_chan}', "
+                f"around='{ref_msg}', limit=20).]"
+            )
+            message_text = f"{pointer}{fetch_hint}\n\n{message_text}"
         return message_text
 
     async def _inbound_model_context_length(self, source: SessionSource, session_key: str) -> int:

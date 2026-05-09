@@ -65,6 +65,13 @@ class MessageEvent:
     reply_to_author_id: Optional[str] = None
     reply_to_author_name: Optional[str] = None
     reply_to_is_own_message: bool = False  # True when the user replied to this bot/assistant's message
+    # LOCAL CARRY: the channel the replied-to message lives in — may differ from the
+    # current chat (user replied to a parent-channel message from inside a thread, or
+    # vice versa). Needed to anchor a discord fetch_messages(around=) on the right channel.
+    reply_to_channel_id: Optional[str] = None
+    # LOCAL CARRY: display name of the replied-to author (Discord adapter populates this;
+    # signal/other adapters populate the upstream reply_to_author_name instead).
+    reply_to_author: Optional[str] = None
     # Structured interactive-prompt reply (relay only): {prompt_id, option_id, label?,
     # prompt_message_id?}; routed to the approval/slash-confirm/clarify resolvers BEFORE dispatch.
     prompt_response: Optional[Dict[str, Any]] = None
