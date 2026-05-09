@@ -1633,7 +1633,18 @@ class GatewayInboundMixin:
             # A preview here silently loses later list items and code; keep that context intact.
             reply_text = event.reply_to_text
             _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
-            message_text = f'[Replying to{_who}: "{reply_text}"]\n\n{message_text}'
+            pointer = f'[Replying to{_who}: "{reply_text}"]'
+            # LOCAL CARRY: active-fetch hint on a separate line so the base pointer stays
+            # byte-identical to upstream. Anchors the REPLIED-TO message (the triggering id
+            # below anchors the user's reply instead).
+            ref_chan = getattr(event, "reply_to_channel_id", None) or getattr(source, "chat_id", None)
+            ref_msg = event.reply_to_message_id
+            fetch_hint = (
+                f"\n[For the full message or surrounding context, call "
+                f"discord(action='fetch_messages', channel_id='{ref_chan}', "
+                f"around='{ref_msg}', limit=20).]"
+            )
+            message_text = f"{pointer}{fetch_hint}\n\n{message_text}"
 
         # Discord: the triggering message id goes on the per-turn user message, never the cached
         # system prompt — it changes every turn and would bust the agent-cache signature. It is
