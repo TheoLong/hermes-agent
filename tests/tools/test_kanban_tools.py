@@ -795,6 +795,56 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     assert d.get("ok") is True and d.get("task_id") == tid
 
 
+def test_add_notify_sub_upserts_notification_mode_on_duplicate(worker_env):
+    """Re-registering a subscription must update notification_mode and preserve
+    origin context fields. Regression: prior `INSERT OR IGNORE` silently
+    dropped a `synthesize`-mode tool-driven subscribe when a `direct`-mode
+    slash-command subscribe already existed for the same (task,platform,
+    chat,thread) tuple — leaving agent-created tasks with the wrong notifier."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        # Slash-command path lands first with direct mode + origin context.
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="discord",
+            chat_id="chat-1",
+            thread_id="thread-1",
+            user_id="user-1",
+            notification_mode="direct",
+            origin_session_id="sess-1",
+            origin_profile="default",
+            origin_context="original message",
+        )
+        # Tool-driven create then upgrades the same subscription to synthesize
+        # without re-supplying the origin context (which it doesn't carry).
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="discord",
+            chat_id="chat-1",
+            thread_id="thread-1",
+            user_id=None,
+            notification_mode="synthesize",
+            origin_session_id=None,
+            origin_profile=None,
+            origin_context=None,
+        )
+        subs = kb.list_notify_subs(conn, task_id=worker_env)
+
+    assert len(subs) == 1, "upsert must not create a duplicate row"
+    row = subs[0]
+    assert row["notification_mode"] == "synthesize", (
+        "notification_mode must reflect the latest subscribe call"
+    )
+    # Origin context fields populated by the first call must survive.
+    assert row["user_id"] == "user-1"
+    assert row["origin_session_id"] == "sess-1"
+    assert row["origin_profile"] == "default"
+    assert row["origin_context"] == "original message"
+
+
 def test_create_worker_root_task_inherits_current_origin_subscription(worker_env):
     """Parentless worker-created follow-up tasks keep the interactive origin."""
     from hermes_cli import kanban_db as kb
