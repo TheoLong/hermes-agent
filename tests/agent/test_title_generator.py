@@ -5,8 +5,11 @@ from unittest.mock import MagicMock, patch
 
 from agent.title_generator import (
     generate_title,
+    regenerate_title,
+    _condense_history,
     auto_title_session,
     maybe_auto_title,
+    maybe_retitle_session,
     _title_language,
 )
 
@@ -273,3 +276,236 @@ class TestMaybeAutoTitle:
 
     def test_skips_if_no_session_db(self):
         maybe_auto_title(None, "sess-1", "hello", "response", [])  # no db
+
+
+class TestCondenseHistory:
+    """Tests for _condense_history() — the whole-conversation renderer."""
+
+    def test_empty_history_returns_empty(self):
+        assert _condense_history([]) == ""
+        assert _condense_history(None) == ""
+
+    def test_skips_system_and_tool_roles(self):
+        history = [
+            {"role": "system", "content": "you are an agent"},
+            {"role": "user", "content": "hello"},
+            {"role": "tool", "content": "tool output"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        out = _condense_history(history)
+        assert "you are an agent" not in out
+        assert "tool output" not in out
+        assert "User: hello" in out
+        assert "Assistant: hi there" in out
+
+    def test_short_history_not_elided(self):
+        history = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        out = _condense_history(history)
+        assert "omitted" not in out
+        assert out.count("User:") == 2
+
+    def test_long_history_keeps_head_and_tail_with_elision(self):
+        # 10 exchanges = 20 messages; head_turns=1 (2 msgs) + tail_turns=3 (6 msgs)
+        history = []
+        for i in range(10):
+            history.append({"role": "user", "content": f"question {i}"})
+            history.append({"role": "assistant", "content": f"answer {i}"})
+        out = _condense_history(history)
+        # Opening turn preserved (anchors intent)
+        assert "question 0" in out
+        assert "answer 0" in out
+        # Latest turns preserved (detect drift)
+        assert "question 9" in out
+        assert "answer 9" in out
+        # A middle turn is gone
+        assert "question 5" not in out
+        # Elision marker present
+        assert "omitted" in out
+
+    def test_truncates_long_messages(self):
+        history = [
+            {"role": "user", "content": "x" * 1000},
+            {"role": "assistant", "content": "y" * 1000},
+        ]
+        out = _condense_history(history)
+        # each message truncated to per_message (400) + ellipsis, not full 1000
+        assert "x" * 401 not in out
+        assert "…" in out
+
+
+class TestRegenerateTitle:
+    """Tests for regenerate_title() — whole-conversation, sticky re-assessment."""
+
+    def _resp(self, text):
+        r = MagicMock()
+        r.choices = [MagicMock()]
+        r.choices[0].message.content = text
+        return r
+
+    def test_returns_none_on_empty_history(self):
+        # No LLM call should happen when there's no transcript.
+        with patch("agent.title_generator.call_llm") as llm:
+            assert regenerate_title([], "Some Title") is None
+            llm.assert_not_called()
+
+    def test_keeps_current_title_when_unchanged(self):
+        history = [
+            {"role": "user", "content": "help me draft the USCIS RFE response"},
+            {"role": "assistant", "content": "Here's the outline..."},
+            {"role": "user", "content": "now write the PDF"},
+            {"role": "assistant", "content": "Generating the PDF..."},
+        ]
+        # Model, seeing the whole conversation, returns the existing title verbatim.
+        with patch("agent.title_generator.call_llm", return_value=self._resp("USCIS RFE Response")):
+            out = regenerate_title(history, "USCIS RFE Response")
+            assert out == "USCIS RFE Response"
+
+    def test_whole_conversation_passed_to_model_not_just_last_exchange(self):
+        """The USCIS-RFE bug: a localized 'write the PDF' detour must not be the
+        only thing the model sees. The opening intent must reach the prompt."""
+        history = [
+            {"role": "user", "content": "help me draft the USCIS RFE response gist"},
+            {"role": "assistant", "content": "Here's the outline of the RFE response..."},
+            {"role": "user", "content": "looks good, keep going"},
+            {"role": "assistant", "content": "Continuing the RFE draft..."},
+            {"role": "user", "content": "now produce the PDF of it"},
+            {"role": "assistant", "content": "Rendering the PDF now..."},
+        ]
+        captured = {}
+
+        def _cap(**kwargs):
+            captured.update(kwargs)
+            return self._resp("USCIS RFE Response")
+
+        with patch("agent.title_generator.call_llm", side_effect=_cap):
+            regenerate_title(history, "USCIS RFE Response")
+
+        user_block = captured["messages"][1]["content"]
+        system_block = captured["messages"][0]["content"]
+        # Current title is handed to the model
+        assert "USCIS RFE Response" in user_block
+        # Opening intent (the real gist) is present, not just the PDF detour
+        assert "RFE response gist" in user_block
+        # The PDF detour is present too (tail), but as context, not the sole input
+        assert "PDF" in user_block
+        # Prompt instructs whole-conversation, keep-biased assessment
+        assert "WHOLE" in system_block
+        assert "UNCHANGED" in system_block
+
+    def test_returns_new_title_on_genuine_drift(self):
+        history = [
+            {"role": "user", "content": "help me draft the USCIS RFE response"},
+            {"role": "assistant", "content": "Here's the outline..."},
+            {"role": "user", "content": "actually forget that, let's debug my docker setup"},
+            {"role": "assistant", "content": "Let's look at your Dockerfile..."},
+            {"role": "user", "content": "the container won't start"},
+            {"role": "assistant", "content": "Check the entrypoint..."},
+        ]
+        with patch("agent.title_generator.call_llm", return_value=self._resp("Debugging Docker Setup")):
+            out = regenerate_title(history, "USCIS RFE Response")
+            assert out == "Debugging Docker Setup"
+
+    def test_pinned_language_prompt(self):
+        history = [
+            {"role": "user", "content": "hola"},
+            {"role": "assistant", "content": "hola, como estas"},
+        ]
+        captured = {}
+
+        def _cap(**kwargs):
+            captured.update(kwargs)
+            return self._resp("Saludo")
+
+        with (
+            patch("agent.title_generator.call_llm", side_effect=_cap),
+            patch("agent.title_generator._title_language", return_value="Spanish"),
+        ):
+            regenerate_title(history, "Greeting")
+
+        system_block = captured["messages"][0]["content"]
+        assert "Write the title in Spanish" in system_block
+
+    def test_returns_none_on_exception(self):
+        history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+        with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
+            assert regenerate_title(history, "Title") is None
+
+    def test_invokes_failure_callback_on_exception(self):
+        history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+        captured = []
+        exc = RuntimeError("boom")
+        with patch("agent.title_generator.call_llm", side_effect=exc):
+            regenerate_title(history, "Title", failure_callback=lambda t, e: captured.append((t, e)))
+        assert captured == [("title regeneration", exc)]
+
+
+class TestMaybeRetitleSession:
+    """Tests for maybe_retitle_session() — the periodic re-title gate."""
+
+    def _history(self, n_user):
+        h = []
+        for i in range(n_user):
+            h.append({"role": "user", "content": f"q{i}"})
+            h.append({"role": "assistant", "content": f"a{i}"})
+        return h
+
+    def test_skips_before_third_user_turn(self):
+        db = MagicMock()
+        with patch("agent.title_generator.regenerate_title") as regen:
+            maybe_retitle_session(db, "s1", "q", "a", self._history(2), every_n_turns=6)
+            import time
+            time.sleep(0.1)
+            regen.assert_not_called()
+
+    def test_skips_off_cadence(self):
+        db = MagicMock()
+        # 4 user turns, every_n_turns=6 -> 4 % 6 != 0 -> skip
+        with patch("agent.title_generator.regenerate_title") as regen:
+            maybe_retitle_session(db, "s1", "q", "a", self._history(4), every_n_turns=6)
+            import time
+            time.sleep(0.1)
+            regen.assert_not_called()
+
+    def test_fires_on_cadence_and_uses_regenerate_title(self):
+        db = MagicMock()
+        db.get_session_title.return_value = "Old Title"
+        history = self._history(6)  # 6 % 6 == 0 -> fire
+        with patch("agent.title_generator.regenerate_title", return_value="New Title") as regen:
+            maybe_retitle_session(db, "s1", "q", "a", history, every_n_turns=6)
+            import time
+            time.sleep(0.3)
+            regen.assert_called_once()
+            # regenerate_title must receive the full history + current title,
+            # NOT just the last user/assistant message.
+            args, kwargs = regen.call_args
+            assert args[0] == history
+            assert args[1] == "Old Title"
+        db.set_session_title.assert_called_once_with("s1", "New Title")
+
+    def test_no_db_write_when_title_unchanged(self):
+        db = MagicMock()
+        db.get_session_title.return_value = "Same Title"
+        history = self._history(6)
+        with patch("agent.title_generator.regenerate_title", return_value="Same Title"):
+            maybe_retitle_session(db, "s1", "q", "a", history, every_n_turns=6)
+            import time
+            time.sleep(0.3)
+        db.set_session_title.assert_not_called()
+
+    def test_callback_fires_on_change(self):
+        db = MagicMock()
+        db.get_session_title.return_value = "Old"
+        history = self._history(6)
+        seen = []
+        with patch("agent.title_generator.regenerate_title", return_value="Brand New"):
+            maybe_retitle_session(
+                db, "s1", "q", "a", history, every_n_turns=6, title_callback=seen.append
+            )
+            import time
+            time.sleep(0.3)
+        assert seen == ["Brand New"]
