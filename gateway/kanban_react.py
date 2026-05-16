@@ -120,7 +120,7 @@ class KanbanReactCoordinator:
                 # An agent turn is running — just queue. mark_turn_done
                 # will (re-)arm the debounce when the turn ends if the
                 # buffer is non-empty at that point.
-                logger.debug(
+                logger.info(
                     "kanban-react: queued (in-flight) sk=%s task=%s kind=%s",
                     session_key, event.task_id, event.kind,
                 )
@@ -130,14 +130,14 @@ class KanbanReactCoordinator:
                 st.timer = asyncio.create_task(
                     self._debounce_then_flush(session_key)
                 )
-                logger.debug(
+                logger.info(
                     "kanban-react: armed debounce sk=%s task=%s kind=%s "
                     "(buffer=1, %.1fs)",
                     session_key, event.task_id, event.kind, self._debounce,
                 )
             else:
                 # Timer already running, just joined the batch.
-                logger.debug(
+                logger.info(
                     "kanban-react: joined batch sk=%s task=%s kind=%s buffer=%d",
                     session_key, event.task_id, event.kind, len(st.buffer),
                 )
