@@ -5735,7 +5735,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            # LOCAL CARRY (cfcd92ccc): do NOT add `or is_free_channel` here —
+            # Theo's config wants free-response channels to STILL auto-thread
+            # per message for conversation isolation. Upstream suppresses it.
+            skip_thread = bool(channel_keys & no_thread_channels)
             auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
