@@ -5628,7 +5628,7 @@ class GatewayRunner:
                                         source_proto=react_source.to_dict(),
                                     )
                             except Exception as _react_exc:
-                                logger.debug(
+                                logger.warning(
                                     "kanban-react: record_event failed "
                                     "(non-fatal): %s",
                                     _react_exc,
