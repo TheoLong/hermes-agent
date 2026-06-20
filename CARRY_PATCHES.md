@@ -12,7 +12,7 @@ Last synced: **2026-06-07** (rebased onto `e3b8b6d32`; 1,776 upstream commits ab
 
 ---
 
-## Inventory (9 commits, bottom → top)
+## Inventory (10 commits, bottom → top)
 
 | # | SHA prefix | Subject | Upstream PR | Risk on rebase |
 |---|------------|---------|-------------|----------------|
@@ -25,6 +25,7 @@ Last synced: **2026-06-07** (rebased onto `e3b8b6d32`; 1,776 upstream commits ab
 | 7 | `ec41e78f3` | fix(discord): restore auto-thread in free-response channels | [#29981](https://github.com/NousResearch/hermes-agent/pull/29981) | PLUGIN-MOVED: target now `plugins/platforms/discord/adapter.py:4806`; rename detection auto-resolved |
 | 8 | `04dd0d08f` | feat(discord): auto-rename threads + periodic retitle | [#29983](https://github.com/NousResearch/hermes-agent/pull/29983) | PLUGIN-MOVED: carry uses `self.adapters.get(source.platform)` (generic registry) so plugin relocation didn't break the adapter handle |
 | 9 | `123e4915d` | docs: inventory carry-patches stack with upstream PR links | (n/a) | SELF — rewrite SHAs on every rebase |
+| 10 | `781868427` | fix: retry holographic memory sqlite locks (author=`jarvis`/JimGat) | [#40167](https://github.com/NousResearch/hermes-agent/pull/40167) | DUPLICATE-WHEN-MERGED — cherry-pick of the upstream PR head; `git patch-id` will drop it once #40167 lands. CLEAN replay while open (touches `plugins/memory/holographic/{store,__init__}.py` + `tests/agent/test_memory_provider.py`). |
 
 SHAs change on every rebase. The **subject lines** are the stable identifier
 for triage; use `git log origin/main..HEAD --format="%h %s"` to refresh.
@@ -171,6 +172,36 @@ this becomes SUPERSEDED.
 
 Operational visibility for the kanban-react path. Always clean replay.
 If #29985 lands upstream, all three are dropped together as DUPLICATE.
+
+---
+
+### 10. `fix: retry holographic memory sqlite locks`
+
+**Author:** `jarvis <jarvis@jarvis.gat.ink>` (JimGat) — NOT a Theo/Tem carry.
+This is a straight cherry-pick of the head of upstream PR
+[#40167](https://github.com/NousResearch/hermes-agent/pull/40167), applied
+locally ahead of merge.
+
+**Problem:** the holographic memory store (`memory_store.db`) is a single
+SQLite file written by BOTH the always-on gateway and any concurrent CLI/cron
+session (e.g. the `daily-self-reflect` cron's headless `hermes chat`
+subprocess). Under writer contention the subprocess's `fact_store` /
+`fact_feedback` writes fast-fail with `database is locked` even though WAL is
+enabled — the connect-`timeout` doesn't reliably translate to a writer-lock
+wait on a reused connection. Surfaced during the 2026-06-20 self-reflect cron
+timeout investigation: the subprocess could read but every fact_store removal
+hit `{"error": "database is locked"}` while the gateway held the WAL write lock.
+
+**Fix:** explicit `PRAGMA busy_timeout = 60000` on the connection + connect
+`timeout` 10s→60s, plus retry-on-`locked` with `rollback()` and exponential
+backoff (0.5·2^n, cap 5s, max 5 retries) on the two write paths. The retry
+counter rides through `args` as `_lock_retry` — safe, since the action handlers
+consume named keys and never splat `args`.
+
+**Rebase:** CLEAN replay while #40167 is open. Once it merges, `git patch-id`
+will flag this as **DUPLICATE** and the next sync drops it — the fix simply
+becomes upstream's copy. Verified locally: 3 new tests pass, full memory
+provider + holographic suite 144 passed / 0 failed.
 
 ---
 
