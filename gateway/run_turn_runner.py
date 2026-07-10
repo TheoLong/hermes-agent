@@ -1798,6 +1798,39 @@ class TurnRunner:
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
         # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
         # failed/interrupted turn is still titled.
+        #
+        # LOCAL CARRY (periodic retitle, PR #29983 residual delta): upstream owns
+        # first-turn semantic titling; this is the periodic half it still lacks.
+        # After the turn completes we re-evaluate the title against the WHOLE
+        # (condensed) conversation and rename only when the durable topic has
+        # drifted — which needs `final_response` + full history, so it cannot
+        # live at the turn-START site above. Reuses upstream's `_on_session_title`
+        # rename lane through a shim for its (title, title_source) signature: a
+        # periodic retitle IS a real model-derived title, so it carries the "llm"
+        # source the rename callbacks gate on. Fire-and-forget on a daemon thread
+        # inside maybe_retitle_session; never affects the turn.
+        try:
+            from agent.title_generator import maybe_retitle_session
+            _raw_cb = getattr(agent, "_on_session_title", None)
+            _retitle_cb = (lambda t: _raw_cb(t, "llm")) if _raw_cb is not None else None
+            maybe_retitle_session(
+                self._runner._session_db,
+                effective_session_id,
+                getattr(ctx, "user_message", None) or "",
+                final_response,
+                agent_history,
+                title_callback=_retitle_cb,
+                failure_callback=(
+                    getattr(agent, "_title_failure_callback", None)
+                    or getattr(agent, "_emit_auxiliary_failure", None)
+                ),
+                main_runtime={
+                    "model": getattr(agent, "model", None),
+                    "provider": getattr(agent, "provider", None),
+                },
+            )
+        except Exception:
+            logger.debug("Periodic session retitle failed", exc_info=True)
         return {
             "final_response": final_response, "last_reasoning": result.get("last_reasoning"), **common,
             "response_previewed": result.get("response_previewed", False),
