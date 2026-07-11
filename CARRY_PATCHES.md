@@ -12,7 +12,7 @@ Last synced: **2026-07-10** (rebased onto current `origin/main`; 518 upstream co
 
 ---
 
-## Inventory (5 commits, bottom → top)
+## Inventory (6 commits, bottom → top)
 
 | # | SHA prefix | Subject | Upstream PR | Risk on rebase |
 |---|------------|---------|-------------|----------------|
@@ -21,6 +21,7 @@ Last synced: **2026-07-10** (rebased onto current `origin/main`; 518 upstream co
 | 3 | `d0d528cd5` | fix(kanban): validate per-task --skills against assignee profile at create time | [#44101](https://github.com/NousResearch/hermes-agent/pull/44101) (deferred to @AIalliAI) | CLEAN this sync. **NO PR of our own** — Theo's #45917/#47496 were closed deferring to @AIalliAI's #44101, still OPEN + not on main, so the create-time preflight remains a real gap we carry. Open no new PR. |
 | 4 | `a7a9369b2` | feat(gateway): kanban auto-react debouncer | [#29985](https://github.com/NousResearch/hermes-agent/pull/29985) | CLEAN this sync (replayed clean onto the 518-commit delta; the prior `reset_session_vars()` additive collision stayed resolved). No upstream auto-react/fanout mechanism found. |
 | 5 | `e4bc33aa4` | feat(discord): periodic thread retitle on top of upstream semantic titles | [#29983](https://github.com/NousResearch/hermes-agent/pull/29983) | **RESHAPED this sync** — see note 5. Upstream `0d9ed9214` landed the first-turn Discord semantic rename; carry reduced to the periodic-retitle delta only. |
+| 6 | `965e4521b` | feat(browser): named browser profiles with same-profile concurrency | [#49691](https://github.com/NousResearch/hermes-agent/pull/49691) | Fresh this install (2026-07-10). Adds `browser.profiles` (name→CDP endpoint) + `::profile:<name>` composite session key routing, plus same-profile concurrency (per-session owned tab + per-endpoint serialization lock). 3 files: `tools/browser_tool.py`, `hermes_cli/config.py`, `tests/tools/test_browser_profiles.py`. Reuses the `::local` seam — additive, low reshape risk. Drop when #49691 merges. |
 
 SHAs change on every rebase. The **subject lines** are the stable identifier
 for triage; use `git log origin/main..HEAD --format="%h %s"` to refresh.
