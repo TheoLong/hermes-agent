@@ -604,6 +604,9 @@ class _CodexResponseAssembler:
         # output_index / first-observed sequence per output item, in lockstep, so settled pending calls merge
         # back in stream order.
         self.output_indexes, self.output_sequences = [], []
+        # True once a .done event was matched to a pending call by call_id rather than item id
+        # (aliased item ids); tells result() the recovered announced ordering must be applied.
+        self.resolved_aliases = False
         self.text_deltas, self.commentary_text_deltas = [], []
         # pending_function_calls: announced-but-unconfirmed function calls keyed by item id. announced_output_order:
         # first-observed (sequence, output_index) per announced item id so a later .done keeps its announced position.
@@ -688,13 +691,38 @@ class _CodexResponseAssembler:
         # Reuse the announced position when known (fresh tail sequence for unannounced items); the .done
         # event's own output_index wins over the announced one.
         done_id = str(_event_field(done_item, "id", ""))
+        # GitHub's Responses surface may confirm a call under a DIFFERENT item id than it
+        # announced (the id is an opaque blob re-minted per event) while keeping call_id
+        # stable. Identity-by-item-id then fails to clear the pending entry, and settlement
+        # re-emits the SAME call a second time with empty arguments — the duplicate executes,
+        # fails on a missing required field, and three in a row trip the repeated-failure
+        # guardrail, halting the turn. call_id is the stable identity across both frames, so
+        # coalesce pending aliases by it. (Upstream PR #94708, VictorYXL.)
+        done_call_id = str(_event_field(done_item, "call_id", "") or "")
+        pending_aliases = []
+        if done_call_id:
+            pending_aliases = [
+                (pending_id, pending)
+                for pending_id, pending in self.pending_function_calls.items()
+                if str(_event_field(pending.get("item"), "call_id", "") or "") == done_call_id
+            ]
         announced_sequence, announced_index = self.announced_output_order.get(done_id, (None, None))
+        if announced_sequence is None and pending_aliases:
+            # Recover the announced stream position from the alias so an aliased call keeps
+            # its original order instead of being pushed to the tail.
+            _, announced_alias = min(pending_aliases, key=lambda alias: alias[1]["sequence"])
+            announced_sequence = announced_alias["sequence"]
+            announced_index = announced_alias["output_index"]
         if announced_sequence is None:
             announced_sequence, self.next_output_sequence = self.next_output_sequence, self.next_output_sequence + 1
         self.output_indexes.append(_event_field(event, "output_index", announced_index))
         self.output_sequences.append(announced_sequence)
         # Confirmed by the authoritative done event; never settle it twice.
         self.pending_function_calls.pop(done_id, None)
+        for pending_id, _pending in pending_aliases:
+            if pending_id != done_id:
+                self.resolved_aliases = True
+            self.pending_function_calls.pop(pending_id, None)
         if _message_phase(done_item) == "commentary" and self.on_commentary_message is not None:
             commentary_text = "".join(self.commentary_text_deltas).strip() or _output_text_of(done_item)
             if commentary_text:
@@ -764,7 +792,15 @@ class _CodexResponseAssembler:
             output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
         # Done items stay authoritative; settlement only fills the gap left by backends that omit
         # per-item done events on a successful completion.
-        if self.pending_function_calls and self.saw_response_completed:
+        #
+        # LOCAL CARRY (upstream PR #94708): when a backend confirms calls under aliased item ids,
+        # the .done events can arrive out of announced order and carry no output_index. The alias
+        # lookup in _on_item_done recovers each call's ANNOUNCED sequence, but that ordering is
+        # only applied by _settled_output() — which used to run solely when pendings survived.
+        # With the alias fix nothing stays pending, so re-run the merge whenever an alias was
+        # resolved, or the recovered ordering is silently discarded and the calls stay in wire
+        # order (a dependent second call could then execute before the first).
+        if (self.pending_function_calls and self.saw_response_completed) or self.resolved_aliases:
             output = self._settled_output()
         # No terminal frame AND no usable content = truncated / rejected stream.
         if not self.saw_terminal and not output:
