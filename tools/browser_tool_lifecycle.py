@@ -683,6 +683,12 @@ def _cleanup_single_browser_session(task_id: str) -> None:
             _bt.logger.warning("lightpanda stop failed for task %s: %s", task_id, e)
     elif _session_has_expired(session_info):
         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
+    elif (session_info.get("features") or {}).get("cdp_override"):
+        # An attached endpoint (``browser.cdp_url`` or a named ``browser.profiles``
+        # entry) is a browser Hermes never launched — long-lived, user-owned, and
+        # usually shared with other sessions. ``close`` tears down that remote browser,
+        # so we only release our own local resources here.
+        _bt.logger.debug("Skipping agent-browser close for attached CDP session %s", task_id)
     else:
         try:
             _session._run_browser_command(task_id, "close", [], timeout=10)
