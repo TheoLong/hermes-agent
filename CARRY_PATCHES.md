@@ -5,8 +5,9 @@ Local commits carried on `consolidated-fixes` on top of `origin/main`
 `git log origin/main..HEAD`; this file is the annotation layer.
 
 **Last synced:** 2026-09-13 (absorbed ~7,097 upstream commits)
-**Live stack:** 10 commits — 8 carries below + 2 self-referential docs commits
-(`6a47c8ca205`, `8d63c77543e`, `62cfb9c5d96` annotate this file itself).
+**Live stack:** the 8 carries in the Inventory below, plus the docs commits that
+maintain this file. Don't hardcode a commit count here — it goes stale the moment
+another docs commit lands. `git log --oneline origin/main..HEAD` is the truth.
 **Rollback branch:** `consolidated-fixes-old-2026-09-13` (local only)
 **Pre-sync snapshot (incl. dropped work):** `sync/2026-09-13-pre-upstream` (local only)
 **Pre-rebase remote stack:** `pre-rebase-backup-2026-09-14` (on `fork` only) —
