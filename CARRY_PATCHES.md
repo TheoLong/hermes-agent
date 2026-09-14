@@ -5,9 +5,12 @@ Local commits carried on `consolidated-fixes` on top of `origin/main`
 `git log origin/main..HEAD`; this file is the annotation layer.
 
 **Last synced:** 2026-09-13 (absorbed ~7,097 upstream commits)
-**Live stack:** 5 commits
-**Rollback branch:** `consolidated-fixes-old-2026-09-13`
-**Pre-sync snapshot (incl. dropped work):** `sync/2026-09-13-pre-upstream`
+**Live stack:** 10 commits — 8 carries below + 2 self-referential docs commits
+(`6a47c8ca205`, `8d63c77543e`, `62cfb9c5d96` annotate this file itself).
+**Rollback branch:** `consolidated-fixes-old-2026-09-13` (local only)
+**Pre-sync snapshot (incl. dropped work):** `sync/2026-09-13-pre-upstream` (local only)
+**Pre-rebase remote stack:** `pre-rebase-backup-2026-09-14` (on `fork` only) —
+the pre-rebase originals of these carries, kept until the rebased stack is trusted.
 
 ---
 
@@ -81,6 +84,33 @@ it does **not** pass on the straight port.
 
 ---
 
+### `70111d77eb0` — named browser profiles
+
+Per-call `profile=` routing to `browser.profiles` endpoints. Live-verified:
+no `profile=` lands on Tem's profile (the default), `profile="theo"` lands on
+Theo's, and an unknown name is refused with the configured-profiles list rather
+than silently falling back. Upstream's `real_profile_pin` is a different feature
+(global, config-time, single identity) and does not supersede it.
+
+### `4df1dda3edc` — attached-CDP cleanup (scope corrected)
+
+**Read this before re-offering the commit upstream.** Its original message claimed
+the agent-browser `close` command tears down an attached browser. That is false, and
+`62cfb9c5d96` retracts it: measured against a real attached Chrome, `close` returns
+`{"closed": true}` and the browser stays up with its tab count unchanged — it ends
+the TAB, not the browser. Upstream #103591/#106601 report the same property as a
+*leak* (attached browsers never torn down), so offering this as a kill-fix would
+contradict two open issues.
+
+What actually killed the profile browser was a gateway restart:
+`hermes-gateway.service` runs `KillMode=mixed` and a browser launched from inside a
+turn is a grandchild via Playwright's node driver, so it dies with the service.
+
+The commit is kept only for its smaller merit — not sending a redundant round-trip
+to a browser Hermes does not own, and making that ownership rule explicit in code.
+Its tests assert on a mocked `_run_browser_command`, so they pin that `close` is not
+SENT; they prove nothing about what sending it would do.
+
 ## Dropped this sync
 
 | Subject | Reason |
@@ -93,9 +123,9 @@ it does **not** pass on the straight port.
 
 ## Deferred (not in the live stack)
 
-| Subject | State |
-|---|---|
-| `feat(browser): named browser profiles with same-profile concurrency` ([#49691](https://github.com/NousResearch/hermes-agent/pull/49691), open) | **Not rebased this sync.** Upstream split `tools/browser_tool.py` into ~10 siblings (`browser_tool_cdp/cloud/session/lifecycle/real_profile/...`), producing 7 conflicts whose carry sides are the whole pre-split file. Resolving to HEAD auto-merged the carry's helpers (`_profile_from_session_key`, `_ensure_owned_tab`, `_endpoint_lock_for`, …) but stranded them: every one is defined and never called, and `_resolve_profile_cdp` / `_get_browser_profiles` / `_DEFAULT_PROFILE` were lost entirely. The wiring lives in the regions that must take upstream's side, so this needs a deliberate port onto the new module layout (which sibling owns endpoint resolution vs. tab ownership), not a conflict resolution. Carry preserved on `consolidated-fixes-old-2026-09-13` and `sync/2026-09-13-pre-upstream`. |
+None. The browser-profiles feature that sat here was rebased and shipped this
+sync as `70111d77eb0` — see the Inventory.
+
 
 ---
 
