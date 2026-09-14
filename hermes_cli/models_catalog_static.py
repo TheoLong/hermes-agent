@@ -166,8 +166,18 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "xai-oauth": list(_XAI_MODELS),
     "copilot-acp": ["copilot-acp"],
     "copilot": _OPENAI_CHAT_MODELS + [
-        "claude-sonnet-4.6", "claude-sonnet-5", "claude-sonnet-4", "claude-sonnet-4.5", "claude-haiku-4.5",
-        "gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro",
+        # LOCAL CARRY: curated list refreshed from a live /models + per-model inference probe
+        # (2026-09-13). The picker's old entries included IDs the account can no longer call
+        # (claude-sonnet-4.6, gemini-3.1-pro-preview, gemini-3-pro-preview, gemini-3-flash-preview,
+        # gemini-2.5-pro all return HTTP 400), which made half the dropdown dead on selection.
+        # Anthropic (all chat-completions, 1M ctx):
+        "claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-5", "claude-haiku-4.5",
+        # Responses-API-only — safe as primary or fallback rung, NOT in auxiliary.* slots:
+        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-sol-fast", "gpt-5.6-luna", "gpt-5.6-terra",
+        "grok-4.6", "grok-4.5",
+        # Google (chat-completions):
+        "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+        "mai-code-1.1-flash",
     ],
     "gemini": [
         "gemini-3.8-flash", "gemini-3.7-flash",
