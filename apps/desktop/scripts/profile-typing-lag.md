@@ -378,8 +378,13 @@ Possible approaches (none implemented here):
 
 - `<React.Profiler>` `onRender` is never called (production build is a
   no-op).
-- `import.meta.env.DEV` is `false`, `PROD` is `true` even under `vite dev`
-  (hence `MODE !== 'production'` as the workaround in `main.tsx`).
+- The React *dependency* is the production build, so anything gated on
+  React's own dev branches is inert. This does NOT extend to
+  `import.meta.env` in app source: verified on the pinned Vite (8.2.0), a
+  dev-server transform injects `{"DEV": true, "MODE": "development",
+  "PROD": false}`, so `import.meta.env.DEV` IS `true` under `vite dev`.
+  (`main.tsx` gates on `MODE !== 'production'`, which is equivalent here —
+  it is not a workaround for a wrong `DEV`.)
 - All the React 19 dev-only warnings/devtools backend hooks are absent.
 
 Root cause likely sits in `vite.config.ts` aliasing + dedupe + Vite 8's
