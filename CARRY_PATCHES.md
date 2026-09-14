@@ -22,7 +22,7 @@ the pre-rebase originals of these carries, kept until the rebased stack is trust
 | `acf443c2d11` | fix(discord): restore auto-thread in free-response channels | [#29981](https://github.com/NousResearch/hermes-agent/pull/29981) (open) | medium | Single-line revert inside a churn-heavy block. Upstream keeps `skip_thread = … or is_free_channel`; we drop the `or`. Re-resolve by keeping upstream's `_extra_or_env_flag` helper and deleting only that clause. |
 | `2106bb1c7fc` | feat(discord): enrich reply context so agents can fetch full thread | [#29982](https://github.com/NousResearch/hermes-agent/pull/29982) (open) | high | 4 files; the reply-prefix builder keeps relocating (now `gateway/run_inbound.py`) and `MessageEvent` moved to `gateway/platforms/event.py`. Keep the carry **additive** — upstream's pointer line byte-identical, hint appended as a second line — or `test_reply_to_injection.py` fails. |
 | `7ef48b11ce3` | feat(discord): periodic thread retitle on top of upstream semantic titles | [#29983](https://github.com/NousResearch/hermes-agent/pull/29983) (open) | high | Turn-end call site now lives in `gateway/run_turn_runner.py` (`_finalize_turn_result`), not `gateway/run.py`. Needs `final_response` + full history, so it cannot move to upstream's turn-START auto-title site. Callback is `agent._on_session_title(title, title_source)` — wrap in a 1-arg shim passing `"llm"`. Session DB is `self._runner._session_db`. |
-| `7c21daefcb9` | fix(codex): coalesce pending Responses calls by call_id | [#94708](https://github.com/NousResearch/hermes-agent/pull/94708) (open, VictorYXL) | medium | **Adopted from upstream** — drop once #94708 merges. Ported onto the refactored `_CodexResponseAssembler`. |
+| `7c21daefcb9` | fix(codex): coalesce pending Responses calls by call_id | [#94708](https://github.com/NousResearch/hermes-agent/pull/94708) (open, VictorYXL) | medium | **Adopted from upstream** — drop once #94708 merges. Ported onto the refactored `_CodexResponseAssembler`. ⚠️ **LOAD-BEARING FOR THE MODEL CHAIN — see the guard note below before dropping.** |
 | `fa1d62911a6` | chore(models): refresh the Copilot picker list against live probes | none (local-only) | low | Curated list moved to `hermes_cli/models_catalog_static.py`. Re-probe rather than replaying the diff — the callable set drifts. |
 | `70111d77eb0` | feat(browser): named browser profiles with same-profile concurrency | [#49691](https://github.com/NousResearch/hermes-agent/pull/49691) (open) | high | Per-call `profile=` on `browser_navigate`, routing to `browser.profiles` endpoints. Upstream's `real_profile_pin` is a DIFFERENT feature (global, config-time, one identity) and does NOT supersede this. Ported onto the split modules: helpers in `tools/browser_tool.py`, `_run_raw_agent_browser` + profile-first precedence in `_create_session_for_key` (`browser_tool_session.py`), fan-out cleanup in `browser_tool_lifecycle.py`. **The `_BROWSER_TOOL_TABLE` handler-defaults tuple must carry `"profile": None`** or the arg is silently dropped before it reaches the handler. |
 | `4df1dda3edc` | fix(browser): never send close to an attached CDP browser | none (local-only) | low | `_cleanup_single_browser_session` skips the agent-browser `close` for sessions flagged `cdp_override` (attached `browser.cdp_url` / `browser.profiles` endpoints). **Scope: redundant-work removal, NOT a crash fix.** Measured on a real attached Chrome, `close` returns `{closed:true}` and the browser SURVIVES with tab count unchanged — it closes the tab, not the browser. Upstream #103591/#106601 document the same property from the opposite side (attached browsers are never torn down, which they call a leak). Do NOT upstream this as a kill-fix; if offered at all, frame it as making the ownership rule explicit. |
@@ -61,6 +61,35 @@ Guarded by `_looks_like_title()` (rejects prose the model returns when it
 answers the prompt conversationally instead of emitting a title).
 
 ### `7c21daefcb9` — Responses duplicate tool call (adopted)
+
+**⚠️ LOAD-BEARING FOR THE MODEL CHAIN — external guard, do not drop silently.**
+This carry is the only thing making responses-only models usable, so it
+gates which models may sit at `model.default` / `fallback_providers[]`.
+Dropping it without noticing silently degrades every turn on
+`gpt-6-astra`, `gpt-5.6-*`, `gpt-5.x`, `grok-4.x`, `mai-code-*`.
+
+Because the fix and its regression test live in the SAME commit, an update
+that drops the carry deletes the test too — the repo then reports green
+while broken. The tripwire therefore lives **outside the repo**:
+
+- `~/.hermes/scripts/check-responses-dedup.py` — replays a captured REAL
+  `gpt-6-astra` SSE stream (`scripts/fixtures/astra_remint_stream.json`,
+  item `id` re-minted across `added`/`done`) through the live assembler and
+  asserts exactly ONE tool call. Exit 0 + silent when healthy; exit 1 with
+  the remediation (`git cherry-pick 7c21daefcb9`) when the fix is gone.
+- Cron `2edab2d539bd` ("Responses dedup carry guard"), daily 08:00,
+  `no_agent` — silent unless it fails.
+
+**Run it as the last step of any `hermes update`**, and again after the
+gateway restarts. Two gotchas if you ever rewrite the guard: hand-written
+synthetic frames do NOT reproduce the bug (only the real capture does), and
+output items come back as a MIX of dicts and `SimpleNamespace` — the
+duplicate is a namespace, so an `isinstance(o, dict)` filter drops it and
+the guard passes on broken code. Verify any change in BOTH directions by
+reverting the carry in the live tree (`patch -R -p1 < <(git show
+7c21daefcb9 -- agent/codex_runtime.py)`), clearing `__pycache__`,
+confirming exit 1, then restoring.
+
 Fixes [#94707](https://github.com/NousResearch/hermes-agent/issues/94707).
 GitHub's Responses surface re-mints the opaque item `id` between
 `output_item.added` and `output_item.done` while keeping `call_id` stable;
