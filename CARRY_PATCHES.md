@@ -5,9 +5,10 @@ Local commits carried on `consolidated-fixes` on top of `origin/main`
 `git log origin/main..HEAD`; this file is the annotation layer.
 
 **Last synced:** 2026-09-13 (absorbed ~7,097 upstream commits)
-**Live stack:** the 8 carries in the Inventory below, plus the docs commits that
-maintain this file. Don't hardcode a commit count here — it goes stale the moment
-another docs commit lands. `git log --oneline origin/main..HEAD` is the truth.
+**Live stack:** runtime patches are enumerated in the Inventory below. Additional
+commits maintain this inventory and correct the desktop performance note at
+`apps/desktop/scripts/profile-typing-lag.md`. Documentation commits are not separate
+runtime patches. `git log --oneline origin/main..HEAD` lists the complete stack.
 **Rollback branch:** `consolidated-fixes-old-2026-09-13` (local only)
 **Pre-sync snapshot (incl. dropped work):** `sync/2026-09-13-pre-upstream` (local only)
 **Pre-rebase remote stack:** `pre-rebase-backup-2026-09-14` (on `fork` only) —
