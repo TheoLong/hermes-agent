@@ -300,7 +300,156 @@ def _is_local_sidecar_key(session_key: str) -> bool:
 
 
 def _bare_task_id_for_session_key(session_key: str) -> str:
+    """Strip a ``::local`` sidecar suffix or a ``::profile:<name>`` suffix, yielding the
+    bare task id that owns the session key."""
+    if _profile_from_session_key(session_key) is not None:
+        return session_key[: session_key.rfind(_PROFILE_PREFIX)]
     return session_key[: -len(_LOCAL_SUFFIX)] if _is_local_sidecar_key(session_key) else session_key
+
+
+def _get_browser_profiles() -> Dict[str, str]:
+    """Return the configured ``browser.profiles`` map (name -> CDP endpoint).
+
+    Read fresh from config on each call (like ``_get_cdp_override``) so a config edit takes
+    effect on the next browser call without a restart. Empty dict when unset or malformed.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            profiles = browser_cfg.get("profiles", {})
+            if isinstance(profiles, dict):
+                # Coerce to str->str, dropping empty/invalid entries.
+                return {
+                    str(k): str(v)
+                    for k, v in profiles.items()
+                    if k and isinstance(v, (str,)) and v.strip()
+                }
+    except Exception as e:
+        logger.debug("Could not read browser.profiles from config: %s", e)
+    return {}
+
+
+def _resolve_profile_cdp(profile: str) -> str:
+    """Resolve a named browser profile to a concrete CDP URL.
+
+    Resolution order:
+      1. ``browser.profiles[profile]`` — explicit named endpoint.
+      2. For the implicit ``default`` profile only: fall back to the legacy single-endpoint
+         ``BROWSER_CDP_URL`` env / ``browser.cdp_url`` config (so pre-profiles configs keep
+         working with no ``profiles`` map).
+
+    Raises ``ValueError`` for an unknown non-default profile. We deliberately do NOT silently
+    fall back to the default endpoint for an unknown name — crossing an account boundary
+    silently is exactly the failure profiles exist to prevent.
+    """
+    profiles = _get_browser_profiles()
+    raw = profiles.get(profile, "")
+    if raw and raw.strip():
+        return _cdp._resolve_cdp_override(raw.strip())
+
+    if profile == _DEFAULT_PROFILE:
+        # Legacy fallback: a config with no profiles map but a bare cdp_url.
+        return _cdp._get_cdp_override() or ""
+
+    # Unknown named profile — fail loud.
+    known = ", ".join(sorted(profiles)) or "(none configured)"
+    raise ValueError(
+        f"Unknown browser profile {profile!r}. "
+        f"Configured profiles: {known}. "
+        f"Add it under browser.profiles in config.yaml."
+    )
+
+
+def _compose_profile_session_key(task_id: str, profile: str) -> str:
+    """Build the composite session key for ``task_id`` under ``profile``."""
+    return f"{task_id}{_PROFILE_PREFIX}{profile}"
+
+
+def _profile_from_session_key(session_key: str) -> Optional[str]:
+    """Extract the browser-profile name from a composite session key.
+
+    Profile session keys look like ``f"{task_id}::profile:{name}"`` (see ``_PROFILE_PREFIX``).
+    Returns the ``name`` portion, or ``None`` when the key carries no profile (bare task_id or
+    a ``::local`` sidecar key).
+    """
+    idx = session_key.find(_PROFILE_PREFIX)
+    if idx == -1:
+        return None
+    name = session_key[idx + len(_PROFILE_PREFIX):]
+    return name or None
+
+
+def _endpoint_lock_for(cdp_url: str) -> threading.Lock:
+    """Return the process-wide serialization lock for one CDP endpoint.
+
+    All browser commands targeting the same Chrome (same resolved ``cdp_url``) share one lock,
+    so the activate-tab-then-act pair is atomic against other sessions on that Chrome. Distinct
+    endpoints get distinct locks and never block each other.
+    """
+    with _endpoint_locks_guard:
+        lock = _endpoint_locks.get(cdp_url)
+        if lock is None:
+            lock = threading.Lock()
+            _endpoint_locks[cdp_url] = lock
+        return lock
+
+
+def _ensure_owned_tab(session_key: str, session_name: str, cdp_url: str) -> Optional[str]:
+    """Return the agent-browser tab ref this profile session owns, creating one.
+
+    The first call for a session opens a fresh, uniquely-labeled tab in the profile's Chrome
+    and records it; subsequent calls return the cached ref. ``None`` means we could not
+    establish an owned tab (agent-browser missing, endpoint down) and callers fall back to
+    un-pinned behaviour.
+
+    Must be called with the endpoint lock held (it mutates shared Chrome state by opening a tab
+    and relies on the label being unique per session).
+    """
+    existing = _session_owned_tab.get(session_key)
+    if existing:
+        return existing
+    # Unique, stable label derived from the session name (already a uuid slug).
+    label = f"h-{session_name}"
+    res = _session._run_raw_agent_browser(
+        session_name, cdp_url, ["tab", "new", "--label", label, "about:blank"]
+    )
+    if not res.get("success"):
+        logger.debug("profile tab acquire failed for %s: %s", session_key, res.get("error"))
+        return None
+    tab_ref = (res.get("data") or {}).get("tabId") or label
+    _session_owned_tab[session_key] = tab_ref
+    _session_endpoint[session_key] = cdp_url
+    logger.info("profile session %s acquired owned tab %s on %s",
+                session_key, tab_ref, _sanitize_url_for_logs(cdp_url))
+    return tab_ref
+
+
+def _activate_owned_tab(session_name: str, cdp_url: str, tab_ref: str) -> None:
+    """Bring this session's owned tab to the foreground before a command.
+
+    agent-browser drives the active tab, so this must run (under the endpoint lock) immediately
+    before the real command to guarantee the command lands on the session's own tab and not one
+    another session just activated.
+    """
+    _session._run_raw_agent_browser(session_name, cdp_url, ["tab", tab_ref], timeout=10)
+
+
+def _release_owned_tab(session_key: str) -> None:
+    """Close and forget a profile session's owned tab (best-effort, on cleanup)."""
+    tab_ref = _session_owned_tab.pop(session_key, None)
+    cdp_url = _session_endpoint.pop(session_key, None)
+    if not tab_ref or not cdp_url:
+        return
+    # Derive the session_name from the active-session record if still present.
+    info = _active_sessions.get(session_key) or {}
+    session_name = info.get("session_name")
+    if not session_name:
+        return
+    with _endpoint_lock_for(cdp_url):
+        _session._run_raw_agent_browser(session_name, cdp_url, ["tab", "close", tab_ref], timeout=10)
 
 
 def _session_info_owned_by_task(session_info: Dict[str, Any], task_id: str, session_key: str) -> bool:
@@ -345,6 +494,19 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # tool) so click/snapshot land in the session that served the last navigation.
 _last_active_session_key: Dict[str, str] = {}
 _LOCAL_SUFFIX = "::local"
+# Named-profile session keys: f"{task_id}::profile:{name}" binds a task to one named
+# profile's dedicated CDP endpoint (its own persistent Chrome / cookie jar), mirroring the
+# ::local sidecar precedent above.
+_PROFILE_PREFIX = "::profile:"
+_DEFAULT_PROFILE = "default"
+# Same-profile concurrency: one lock per resolved CDP endpoint, so the
+# activate-tab-then-act pair is atomic against other sessions on that Chrome.
+_endpoint_locks: Dict[str, threading.Lock] = {}
+_endpoint_locks_guard = threading.Lock()
+# session_key -> the agent-browser tab ref that session owns on its endpoint.
+_session_owned_tab: Dict[str, str] = {}
+# session_key -> the resolved CDP endpoint its owned tab lives on.
+_session_endpoint: Dict[str, str] = {}
 _cleanup_done = False
 
 # Inactivity timeout: config.yaml is authoritative; BROWSER_INACTIVITY_TIMEOUT
@@ -444,6 +606,10 @@ BROWSER_TOOL_SCHEMAS = [
                 "url": {
                     "type": "string",
                     "description": "The URL to navigate to (e.g., 'https://example.com')"
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Optional named browser profile for account isolation. Only set this when operating a specific logged-in identity that maps to a configured profile under browser.profiles in config.yaml (each profile is a separate persistent browser with its own cookies/logins). The profile sticks to all follow-up browser_snapshot/click/type calls on this task. Omit for normal browsing (uses the default profile). Passing an unconfigured profile name errors rather than silently using the default — it never crosses an account boundary by accident."
                 }
             },
             "required": ["url"]
@@ -702,10 +868,17 @@ def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> Non
         logger.debug("Auto-snapshot after navigate failed: %s", e)
 
 
-def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+def browser_navigate(url: str, task_id: Optional[str] = None, profile: Optional[str] = None) -> str:
     """Navigate to ``url``; JSON with title, compact snapshot and, on first nav, stealth features.
     Hybrid routing decides BEFORE the safety checks whether this URL goes to a local sidecar
-    (the cloud provider never sees it then, so the private-address checks are relaxed)."""
+    (the cloud provider never sees it then, so the private-address checks are relaxed).
+
+    Args:
+        profile: Optional named browser profile (from ``browser.profiles`` in config.yaml).
+            Binds this navigation — and every follow-up snapshot/click/type on the same task —
+            to that profile's dedicated CDP endpoint, so separate accounts stay isolated.
+            Omit to use the ``default`` profile.
+    """
     url, safety_error = _secret_url_error_normalized(url)
     if safety_error is not None:
         return json.dumps(safety_error)
@@ -713,6 +886,28 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     effective_task_id = task_id or "default"
     nav_session_key = _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
+
+    # A named profile overrides session keying: bind this nav (and all follow-up calls on the
+    # same task) to that profile's dedicated CDP endpoint. A profile pins one explicit
+    # endpoint, so it supersedes ::local hybrid routing. Validated UP FRONT so an unknown
+    # profile fails loud here rather than mid-session — never a silent fallback that would
+    # cross an account boundary.
+    if profile:
+        try:
+            resolved = _resolve_profile_cdp(profile)
+        except ValueError as e:
+            return json.dumps({"success": False, "error": str(e)})
+        if not resolved:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Browser profile {profile!r} resolves to no CDP endpoint. "
+                    f"Set browser.profiles.{profile} (or browser.cdp_url for "
+                    f"the default profile) in config.yaml."
+                ),
+            })
+        nav_session_key = _compose_profile_session_key(effective_task_id, profile)
+        auto_local_this_nav = False
 
     safety_error = _url_policy_error(url, auto_local=auto_local_this_nav)
     if safety_error is not None:
@@ -1280,7 +1475,7 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
 # function is the module global of the same name. Routed-through-extension tools (gate None)
 # use the per-action gate; get_images/console/vision keep the plain requirement checks.
 _BROWSER_TOOL_TABLE = (
-    ("browser_navigate", "🌐", None, {"url": ""}),
+    ("browser_navigate", "🌐", None, {"url": "", "profile": None}),
     ("browser_snapshot", "📸", None, {"full": False}, ("user_task",)),
     ("browser_click", "👆", None, {"ref": ""}),
     ("browser_type", "⌨️", None, {"ref": "", "text": ""}),

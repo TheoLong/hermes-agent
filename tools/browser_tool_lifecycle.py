@@ -554,18 +554,33 @@ def _drop_last_active_binding(task_id: str) -> None:
 
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """Clean up browser session(s) for a task: a bare task id reaps BOTH the primary
-    session and any hybrid local sidecar; a ``::local`` key reaps only that one."""
+    session and any hybrid local sidecar, plus every named-profile session it spawned;
+    a ``::local`` or ``::profile:<name>`` key reaps only that one."""
     if task_id is None:
         task_id = "default"
 
     session_keys = [task_id]
     sidecar_key = f"{task_id}{_bt._LOCAL_SUFFIX}"
+    explicit_profile = _bt._profile_from_session_key(task_id)
     with _bt._cleanup_lock:
         if not _bt._is_local_sidecar_key(task_id) and sidecar_key in _bt._active_sessions:
             session_keys.append(sidecar_key)
+        # A bare task id owns every profile session opened under it — reap them all, or a
+        # profile's Chrome keeps a live session (and its owned tab) after cleanup.
+        if explicit_profile is None and not _bt._is_local_sidecar_key(task_id):
+            prefix = f"{task_id}{_bt._PROFILE_PREFIX}"
+            session_keys.extend(k for k in list(_bt._active_sessions) if k.startswith(prefix))
     for session_key in session_keys:
+        _bt._release_owned_tab(session_key)
         _cleanup_single_browser_session(session_key)
-    _drop_last_active_binding(task_id)
+    # An explicit profile key must not blow away a pointer aimed at a still-live session;
+    # only drop the binding when it names something we just reaped.
+    if explicit_profile is None:
+        _drop_last_active_binding(task_id)
+    else:
+        bare = _bt._bare_task_id_for_session_key(task_id)
+        if _bt._last_active_session_key.get(bare) in session_keys:
+            _drop_last_active_binding(bare)
 
 
 def _kill_verified_daemon(socket_dir: str, session_name: str) -> bool:

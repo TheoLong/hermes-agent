@@ -39,7 +39,7 @@ def _route_spy(monkeypatch):
     monkeypatch.setattr(
         browser_tool,
         "browser_navigate",
-        lambda url="", task_id=None, local_browser=False: "legacy-nav",
+        lambda url="", task_id=None, profile=None, local_browser=False: "legacy-nav",
     )
     monkeypatch.setattr(browser_cdp_tool, "browser_cdp", lambda *a, **k: "legacy-cdp")
     return calls
