@@ -139,7 +139,7 @@ def credentials(browser, tmp_path, monkeypatch, capsys):
     return store, items, values
 
 
-@pytest.mark.parametrize("case", ["change", "change_without_current", "signup_off", "signup_tokens",
+@pytest.mark.parametrize("case", ["change", "change_formless", "change_reactive", "change_without_current", "signup_off", "signup_tokens",
     "signup_single", "login", "ordinary_new_excluded", "ordinary_confirmation_excluded", "otp_excluded"])
 def test_real_fill_and_secret_blindness(browser, credentials, case):
     store, items, values = credentials
@@ -148,7 +148,9 @@ def test_real_fill_and_secret_blindness(browser, credentials, case):
     if case.startswith("change"):
         html = form(OLD + NEW + CONFIRM)
         args["mode"] = "password_change"
-        if case == "change":
+        if case == "change_formless":
+            html = html.replace('<form method=post>', '<div>').replace('</form>', '</div>')
+        if case in ("change", "change_formless", "change_reactive"):
             args["current_handle"] = items["current"].id
             expected = [values["current"], values["new"], values["new"]]
         else:
@@ -169,12 +171,21 @@ def test_real_fill_and_secret_blindness(browser, credentials, case):
                 "otp_excluded": form('<input type=password autocomplete=one-time-code>')}[case]
         expected = [values["current"], "", ""] if case == "login" else [""]
     navigate(browser, html)
-    # The page cannot override the supervisor's isolated-world natives.
-    evaluate(browser, "void Object.defineProperty(HTMLInputElement.prototype, 'value', {set(){throw Error('page setter')},get(){return 'page-world'}})")
+    if case == "change_reactive":
+        evaluate(browser, """(() => {
+          const state = {}; const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+          document.addEventListener('input', e => {
+            state[e.target.name] = native.get.call(e.target);
+            document.querySelectorAll('input').forEach(el => native.set.call(el, state[el.name] || ''));
+          });
+        })()""")
+    else:
+        # The page cannot override the supervisor's isolated-world natives.
+        evaluate(browser, "void Object.defineProperty(HTMLInputElement.prototype, 'value', {set(){throw Error('page setter')},get(){return 'page-world'}})")
     raw = registry.dispatch("browser_vault_fill", args, task_id=browser.task)
     assert isinstance(raw, str)
     result = json.loads(raw)
-    should_fill = case in ("change", "change_without_current", "signup_off", "signup_tokens", "signup_single", "login")
+    should_fill = case in ("change", "change_formless", "change_reactive", "change_without_current", "signup_off", "signup_tokens", "signup_single", "login")
     assert result["success"] is should_fill, result
     actual = evaluate(browser, "Array.from(document.querySelectorAll('input')).map(e=>e.value)", world_name=vault._VAULT_ISOLATED_WORLD)
     assert actual == expected, "password targets/values differ"
@@ -192,7 +203,7 @@ def test_real_fill_and_secret_blindness(browser, credentials, case):
 
 
 @pytest.mark.parametrize("case", ["origin", "identity", "handle_origin", "same_handle", "missing_handle", "ordinary_new",
-    "multiform", "ambiguous", "hidden", "disabled", "readonly", "otp", "conflicting_roles", "missing_confirmation",
+    "multiform", "formless_multiple", "ambiguous", "hidden", "disabled", "readonly", "otp", "conflicting_roles", "missing_confirmation",
     "race_disabled", "race_hidden", "race_readonly", "race_type", "race_label", "race_autocomplete", "race_form",
     "race_clone", "race_extra", "race_origin", "maxlength"])
 def test_refusal_is_atomic(browser, credentials, monkeypatch, case):
@@ -210,6 +221,7 @@ def test_refusal_is_atomic(browser, credentials, monkeypatch, case):
     if case == "missing_handle":
         args["current_handle"] = "vault_missing"
     html = {"multiform": html + form(NEW + CONFIRM),
+            "formless_multiple": '<div>' + OLD + NEW + CONFIRM + '</div><div>' + NEW + CONFIRM + '</div>',
             "ambiguous": form(OLD + '<input type=password name=unknown>' + CONFIRM),
             "hidden": form(OLD + NEW + CONFIRM.replace('name=newPassword2', 'name=newPassword2 hidden')),
             "disabled": form(OLD + NEW + '<fieldset disabled>' + CONFIRM + '</fieldset>'),
@@ -258,3 +270,27 @@ def test_refusal_is_atomic(browser, credentials, monkeypatch, case):
     assert browser.submitted == 0
     browser.records.append({"case": case, "passed": True, "error_type": result["error_type"],
                             "no_partial_writes": True, "submitted": False})
+
+
+def test_input_callback_mutation_stops_later_writes(browser, credentials):
+    _, items, values = credentials
+    navigate(browser, form(OLD + NEW + CONFIRM))
+    evaluate(browser, """document.addEventListener('input', e => {
+      if (e.target.name === 'oldPassword') {
+        const confirmation = document.querySelector('[name=newPassword2]');
+        confirmation.value = ''; confirmation.disabled = true;
+      }
+    })""")
+    raw = registry.dispatch('browser_vault_fill', {
+        'handle': items['new'].id, 'mode': 'password_change',
+        'current_handle': items['current'].id}, task_id=browser.task)
+    assert isinstance(raw, str)
+    result = json.loads(raw)
+    assert result['success'] is False
+    assert result['error_type'] == 'page_changed_during_events'
+    assert evaluate(browser, "document.querySelector('[name=newPassword2]').value === ''") is True
+    assert evaluate(browser, "document.querySelectorAll('[data-hermes-vault-slot]').length") == 0
+    assert not any(secret in raw for secret in values.values())
+    assert browser.submitted == 0
+    browser.records.append({'case': 'input_callback_mutation', 'passed': True,
+                            'invalid_target_not_refilled': True, 'submitted': False})

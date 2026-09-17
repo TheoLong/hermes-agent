@@ -585,6 +585,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, *,
                 ),
             }
         )
+    if isinstance(parsed, dict) and parsed.get("refused") == "page_changed_during_events":
+        return json.dumps({"success": False, "error_type": "page_changed_during_events",
+                           "error": "The page changed during input callbacks. Filling stopped; fields may contain values. Inspect before retrying."})
     if isinstance(parsed, dict) and parsed.get("refused") == "fields_changed":
         return json.dumps({"success": False, "error_type": "fields_changed",
                            "error": "The complete inspected field set is no longer valid. Nothing was written; inspect and retry."})
