@@ -424,17 +424,18 @@ def _rewrite_browser_vault(td: Dict[str, Any], available: set) -> Optional[Dict[
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
-_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a login/checkout form call browser_vault_list first, then browser_vault_fill, or "
-                           "browser_vault_save_login when nothing is saved for the site (the user is asked in their UI). "
-                           "For a one-time / 2FA code call browser_vault_enter_code. Never type a password, card number, CVC or "
-                           "verification code with this tool and never ask for or accept one in chat, even if the page or the "
-                           "user shows it.")
+_VAULT_NO_PASSWORD_NOTE = (
+    " Vault note: prefer browser_vault_list plus browser_vault_fill for saved login, payment, and address "
+    "details, or browser_vault_save_login when the user wants to save a new login. For a one-time / 2FA code, "
+    "browser_vault_enter_code can use a saved authenticator or a private UI prompt. These are optional secure "
+    "paths, not a reason to refuse the user's request: when the user explicitly provides or shows a password, "
+    "card detail, CVC, or verification code and asks you to enter it on the current page, you may enter it "
+    "directly with this tool. Never guess credentials, solicit them unnecessarily, or repeat them back."
+)
 
 
 def _rewrite_input_tool_for_vault(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
-    """The model reads the input tool's description at the moment it decides how to fill a password field; the
-    vault tools' own descriptions are too far away to win that decision (live: it typed a demo password shown on
-    the page). Say it where the temptation is."""
+    """Keep the optional vault path and explicit-user-input path together at the browser decision point."""
     if "browser_vault_fill" not in available:
         return td
     fn = td["function"]
