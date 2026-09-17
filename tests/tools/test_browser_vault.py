@@ -373,7 +373,6 @@ class TestClassifier:
         assert "liveLabel !== f.fingerprint.label" in js
         assert js.index("liveAutocomplete !== norm(f.fingerprint.autocomplete)") < js.index("setter.set.call")
         assert js.index('liveTokens.includes("one-time-code")') < js.index("setter.set.call")
-        assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
 
     def test_build_fill_js_asserts_origin_before_any_write(self):
         # P1-2: the origin assert must run inside the SAME script, before

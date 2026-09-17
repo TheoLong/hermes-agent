@@ -50,7 +50,10 @@ _CHECKOUT_HEURISTICS = (
 
 _EXCLUDED_AUTOCOMPLETE = {"one-time-code"}
 
-_RE_EXCLUDED_PASSWORD = re.compile(r"\b(?:new|confirm|create|repeat)\s*password\b")
+_RE_EXCLUDED_PASSWORD = re.compile(r"\b(?:new|confirm|create|repeat|re\s*type)\s*(?:new\s*)?password\b")
+_RE_CURRENT_PASSWORD = re.compile(r"\b(?:old|current|existing)\s*password\b")
+_RE_NEW_PASSWORD = re.compile(r"\b(?:new|create)\s*password\b")
+_RE_CONFIRM_PASSWORD = re.compile(r"\b(?:confirm|repeat|re\s*type)\s*(?:new\s*)?password\b")
 _RE_EMAIL = re.compile(r"\b(?:e[\s-]?mail|email address)\b")
 _RE_TEL = re.compile(r"\b(?:phone|telephone|mobile)\b")
 _RE_USERNAME = re.compile(
@@ -59,6 +62,7 @@ _RE_USERNAME = re.compile(
 
 
 def _normalize_text(value: str) -> str:
+    value = re.sub(r"([a-z])([A-Z])", lambda m: m[1] + " " + m[2], value)
     value = unicodedata.normalize("NFKD", value).lower()
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
@@ -74,6 +78,7 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    fillable: bool = True
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "LoginControl":
@@ -87,6 +92,7 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            fillable=raw.get("fillable", True) is True,
         )
 
 
@@ -111,15 +117,14 @@ def classify_login_control(
             return ClassifiedLoginControl(control, 100, "new-password")
         return None
 
-    for token in LOGIN_AUTOFILL_TOKENS:
-        if token in autocomplete_tokens:
-            return ClassifiedLoginControl(control, 100, token)
-
     searchable = _normalize_text(
         " ".join(part for part in (control.name, control.label) if part)
     )
-    if _RE_EXCLUDED_PASSWORD.search(searchable):
+    if _RE_EXCLUDED_PASSWORD.search(searchable) or _RE_OTP.search(searchable):
         return None
+    for token in LOGIN_AUTOFILL_TOKENS:
+        if token in autocomplete_tokens:
+            return ClassifiedLoginControl(control, 100, token)
     if control.type == "password":
         return ClassifiedLoginControl(control, 90, "current-password")
     if control.type == "email":
@@ -233,6 +238,47 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
     return None
 
 
+def select_new_password_fields(
+    controls: List[LoginControl], *, mode: str, include_current: bool
+) -> List[ClassifiedLoginControl]:
+    """Fail closed unless the entire password form has unambiguous roles.
+
+    No positional guessing or cross-form ranking: hidden/disabled password
+    controls also count, so a missing confirmation cannot become a single fill.
+    """
+    passwords = [c for c in controls if c.type == "password"]
+    forms = {c.form_index for c in passwords}
+    if not passwords or len(forms) != 1 or None in forms or any(not c.fillable for c in passwords):
+        raise ValueError("Expected one visible, enabled password form; hidden, disabled or multiple forms are refused.")
+    selected = []
+    roles = []
+    for c in passwords:
+        tokens = set(c.autocomplete.lower().split())
+        text = _normalize_text(c.name + " " + c.label)
+        if "one-time-code" in tokens or _RE_OTP.search(text):
+            raise ValueError("One-time-code controls cannot be used for password creation or changes.")
+        current = "current-password" in tokens or bool(_RE_CURRENT_PASSWORD.search(text))
+        new = "new-password" in tokens or bool(_RE_NEW_PASSWORD.search(text))
+        confirm = bool(_RE_CONFIRM_PASSWORD.search(text))
+        if current and (new or confirm):
+            raise ValueError("Conflicting password field roles; nothing was filled.")
+        role = "current" if current else "confirm" if confirm else "new" if new else None
+        if role is None:
+            raise ValueError("Ambiguous password field: explicit new/current labels or autocomplete tokens are required.")
+        roles.append(role)
+        if role != "current" or include_current:
+            selected.append(ClassifiedLoginControl(c, 100, "current-password" if current else "new-password"))
+    if roles.count("current") > 1 or (mode == "signup" and "current" in roles):
+        raise ValueError("Unexpected current-password fields for this operation.")
+    if include_current and roles.count("current") != 1:
+        raise ValueError("A current handle requires exactly one current-password field.")
+    new_count, confirm_count = roles.count("new"), roles.count("confirm")
+    valid_pair = (new_count, confirm_count) in ((1, 1), (2, 0))
+    if not valid_pair and not (mode == "signup" and (new_count, confirm_count) == (1, 0)):
+        raise ValueError("Expected a new password and confirmation pair (signup also permits a single new-password field).")
+    return sorted(selected, key=lambda c: c.control.index)
+
+
 def select_checkout_fills(classified: List[ClassifiedLoginControl], secret: Dict[str, str],
                           field_tokens: Dict[str, str]) -> List[Dict[str, Any]]:
     """Map a payment/address secret payload onto the best control per autocomplete token.
@@ -279,8 +325,9 @@ def build_otp_fills(otp_controls: List[ClassifiedLoginControl], code: str) -> Li
     return [{"index": best.control.index, "token": "one-time-code", "value": code}]
 
 
-def build_inspection_js(nonce: str) -> str:
-    return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+def build_inspection_js(nonce: str, *, include_unfillable: bool = False) -> str:
+    return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+            .replace("__INCLUDE_UNFILLABLE__", json.dumps(include_unfillable)))
 
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
@@ -289,11 +336,13 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const forms = Array.from(document.forms);
   const stateKey = "__hermesVaultInspection:" + nonce;
   Object.defineProperty(globalThis, stateKey, {
-    value: { elements, originalForms: elements.map((element) => element.form) },
+    value: { elements, originalForms: elements.map((element) => element.form),
+      passwords: elements.filter((element) => element.type === "password") },
     configurable: true,
   });
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
+    const usable = () => {
     if (element.disabled || element.readOnly || element.matches(":disabled")) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
     const style = getComputedStyle(element);
@@ -302,6 +351,10 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) return [];
     if (element.getClientRects().length === 0) return [];
+    return [true];
+    };
+    const fillable = usable().length > 0;
+    if (!fillable && !(__INCLUDE_UNFILLABLE__ && element.type === "password")) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
@@ -309,6 +362,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     return [{
+      fillable,
       autocomplete: element.autocomplete || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
       index,
@@ -328,7 +382,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
-def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "", *,
+                  mode: str = "login") -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -354,7 +409,8 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
         ]
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
-            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
+            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
+            .replace("__EXPLICIT_NEW__", json.dumps(mode in ("signup", "password_change"))))
 
 
 _FILL_JS_TEMPLATE = """(() => {
@@ -363,6 +419,7 @@ _FILL_JS_TEMPLATE = """(() => {
     return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
   }
   const fills = __FILLS__;
+  const explicitNew = __EXPLICIT_NEW__;
   const nonce = __NONCE__;
   const stateKey = "__hermesVaultInspection:" + nonce;
   const state = globalThis[stateKey];
@@ -370,21 +427,21 @@ _FILL_JS_TEMPLATE = """(() => {
   const forms = Array.from(document.forms);
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
-  for (const f of fills) {
+  const resolve = (f) => {
     const stamped = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
     const el = state && state.elements ? state.elements[f.index] : null;
-    if (!el || stamped !== el || !state.originalForms || state.originalForms[f.index] !== el.form) continue;
-    if ((f.token === "current-password" || f.token === "new-password") && el.type !== "password") continue;
+    if (!el || stamped !== el || !state.originalForms || state.originalForms[f.index] !== el.form) return null;
+    if ((f.token === "current-password" || f.token === "new-password") && el.type !== "password") return null;
     try {
       if (f.token === "current-password" || f.token === "new-password") {
-        if (!f.fingerprint || el.disabled || el.readOnly || el.matches(":disabled")) continue;
-        if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(el.type)) continue;
+        if (!f.fingerprint || el.disabled || el.readOnly || el.matches(":disabled")) return null;
+        if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(el.type)) return null;
         const style = getComputedStyle(el);
-        if (style.display === "none" || style.visibility === "hidden" || Number.parseFloat(style.opacity || "1") <= 0.01) continue;
-        if (typeof el.checkVisibility === "function" && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
+        if (style.display === "none" || style.visibility === "hidden" || Number.parseFloat(style.opacity || "1") <= 0.01) return null;
+        if (typeof el.checkVisibility === "function" && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return null;
         const rect = el.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) continue;
-        if (el.getClientRects().length === 0) continue;
+        if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) return null;
+        if (el.getClientRects().length === 0) return null;
         const liveAutocomplete = norm(el.autocomplete);
         const liveTokens = liveAutocomplete.split(/\\s+/).filter(Boolean);
         const labels = el.labels ? Array.from(el.labels, (label) => label.textContent || "") : [];
@@ -404,15 +461,45 @@ _FILL_JS_TEMPLATE = """(() => {
         const liveName = [el.name, el.id].join(" ");
         const liveMaxLength = el.maxLength > 0 ? el.maxLength : null;
         const liveType = el.tagName === "SELECT" ? "select" : (el.type || "");
-        if (liveAutocomplete !== norm(f.fingerprint.autocomplete)) continue;
-        if (liveFormIndex !== f.fingerprint.form_index) continue;
-        if (liveLabel !== f.fingerprint.label) continue;
-        if (liveName !== f.fingerprint.name) continue;
-        if (liveMaxLength !== f.fingerprint.max_length) continue;
-        if (liveType !== f.fingerprint.type) continue;
-        if (f.token === "new-password" && !liveTokens.includes("new-password")) continue;
-        if (f.token === "current-password" && (liveTokens.includes("new-password") || liveTokens.includes("one-time-code"))) continue;
+        if (liveAutocomplete !== norm(f.fingerprint.autocomplete)) return null;
+        if (liveFormIndex !== f.fingerprint.form_index) return null;
+        if (liveLabel !== f.fingerprint.label) return null;
+        if (liveName !== f.fingerprint.name) return null;
+        if (liveMaxLength !== f.fingerprint.max_length) return null;
+        if (liveType !== f.fingerprint.type) return null;
+        if (f.token === "new-password" && !explicitNew && !liveTokens.includes("new-password")) return null;
+        if (f.token === "current-password" && (liveTokens.includes("new-password") || liveTokens.includes("one-time-code"))) return null;
+        if (liveTokens.includes("one-time-code")) return null;
+        if (el.maxLength > 0 && f.value.length > el.maxLength) return null;
       }
+      return el;
+    } catch (_) { return null; }
+  };
+  const cleanup = () => document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  const refuse = () => { cleanup(); return JSON.stringify({ refused: "fields_changed", filled: 0 }); };
+  if (explicitNew) {
+    const livePasswords = Array.from(document.querySelectorAll('input[type="password"]'));
+    if (!state || !state.passwords || livePasswords.length !== state.passwords.length ||
+        livePasswords.some((el, i) => el !== state.passwords[i])) return refuse();
+  }
+  const targets = fills.map(resolve);
+  // Validate the COMPLETE target set before any setter, focus or event can run.
+  if (targets.some((el) => !el)) return refuse();
+  if (explicitNew) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+    if (!setter || !setter.set) return refuse();
+    for (let i = 0; i < fills.length; i++) setter.set.call(targets[i], fills[i].value);
+    cleanup();
+    // Page callbacks cannot redirect later writes: all native assignments are complete.
+    for (const el of targets) {
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    return JSON.stringify({ filled: targets.length });
+  }
+  for (let i = 0; i < fills.length; i++) {
+    const f = fills[i], el = targets[i];
+    try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
         const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
