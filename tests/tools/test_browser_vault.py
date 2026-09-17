@@ -881,6 +881,19 @@ class TestVaultHardening:
 
 
 
+    def test_available_vault_preserves_explicit_direct_entry(self):
+        """Exposing Vault must add a secure option without taking control away from the user."""
+        import model_tools
+
+        input_tool = model_tools._fn_def({"name": "browser_type", "description": "Type into an input."})
+        vault_tool = model_tools._fn_def({"name": "browser_vault_fill", "description": "Fill from Vault."})
+        [rewritten, _] = model_tools._apply_dynamic_schemas([input_tool, vault_tool])
+        description = rewritten["function"]["description"]
+
+        assert "optional secure paths" in description
+        assert "explicitly provides or shows" in description
+        assert "you may enter it directly" in description
+
 
 def test_every_registered_tool_schema_declares_openai_style_parameters():
     """The registry emits ``parameters`` (OpenAI function shape) and every provider adapter converts from

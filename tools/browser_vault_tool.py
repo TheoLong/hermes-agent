@@ -256,8 +256,11 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        out["hint"] = (
+            "No saved logins. Offer browser_vault_save_login if the user wants to save this login. If the user "
+            "already provided or showed a password and explicitly asked you to enter it, direct browser entry "
+            "remains allowed."
+        )
     if locked:
         out["locked"] = locked
     if errors:
@@ -649,7 +652,7 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
 BROWSER_VAULT_LIST_SCHEMA = {
     "name": "browser_vault_list",
     "description": (
-        "ALWAYS call this first when a page asks for a password, card or address. Lists saved website logins, "
+        "Use this when the user wants a saved credential or prefers Vault autofill. Lists saved website logins, "
         "payment cards and addresses as handles with metadata (kind, label, backend, bound origin; logins also "
         "carry identifier + identifier_type so you can type the username yourself with the browser's input tool). "
         "Secret values are NEVER returned. Sources: the local Hermes vault plus any installed password manager "
@@ -657,8 +660,9 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
         "unavailable_in_this_session, tell the user to unlock it from an interactive session. Workflow: type the "
         "identifier into the login form, then browser_vault_fill with the handle. No item for this origin: call "
-        "browser_vault_save_login. Passwords are typed ONLY by these tools, never by you with the browser's input "
-        "tool and never repeated in chat, even when a page or the user shows you one."
+        "browser_vault_save_login if the user wants to save one. Vault is optional: credentials explicitly "
+        "provided or shown by the user for entry on the current page may instead be typed directly with the "
+        "browser's input tool. Never repeat secret values back."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
@@ -717,10 +721,11 @@ BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
         "The current page is a login form and browser_vault_list has no item for its origin: ask the user, "
         "through a masked prompt in their UI, to save the login for this site. Hermes stores it encrypted, "
         "bound to the page origin, and fills the password immediately; you receive only the handle and the "
-        "identifier to type. This is the ONLY way a password may reach a page: never type one yourself, never "
-        "ask for or accept one in chat, even if the page or the user displays it. A save_declined result means "
-        "stop asking for this turn and tell the user they can retry, or add it later in Settings → Passwords & "
-        "Logins / `hermes vault add`."
+        "identifier to type. This is an optional secure path, not a requirement: use direct browser entry instead "
+        "when the user explicitly provides or shows the password and asks you to enter it without saving. A "
+        "save_declined result means stop asking to save for this turn; continue with direct entry only if the "
+        "user already requested it, or tell them they can retry or add it later in Settings → Passwords & Logins / "
+        "`hermes vault add`."
     ),
     "parameters": {
         "type": "object",
@@ -735,8 +740,9 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     "description": (
         "The page asks for a one-time / verification / 2FA code after the password: call this. If the saved login "
         "has an authenticator key the code is generated and entered with no questions; otherwise the user is asked "
-        "for the code in their UI (they read it from their phone, email or authenticator app). The code never enters "
-        "the conversation: never ask for it in chat, never type it with the browser's input tool. no_code_field means "
+        "for the code in their UI (they read it from their phone, email or authenticator app). If the user already "
+        "provided or showed the code and explicitly asked you to enter it, direct browser entry is also allowed. "
+        "Never repeat the code back. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
         "for the page to move on."
     ),
