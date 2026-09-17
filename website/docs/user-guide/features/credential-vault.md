@@ -93,6 +93,41 @@ with `hermes vault rm <handle>`. The generated password is not recoverable
 through the CLI. This command creates login items only; payment-card fills still
 require human confirmation.
 
+## Creating and changing website passwords
+
+Generate a **separate** login entry for the intended account using `generate-login`
+above. Its origin, identifier and identifier type must match the current login
+exactly. Neither generation nor filling confirms that the website accepted a
+password change; keep the old entry until the change is verified.
+
+After the user authorizes account creation or a password change:
+
+- Creation: `browser_vault_fill(handle="<generated handle>", mode="signup")`.
+- Change: `browser_vault_fill(handle="<generated handle>", mode="password_change",
+  current_handle="<current handle>")`.
+- Omit `current_handle` to leave an existing old-password field untouched.
+
+These modes operate on the current supervised page, without switching tabs.
+They accept only a generated new login, and the optional current handle must be
+another login with the same exact origin and identity. New and confirmation
+fields may use `autocomplete="new-password"` or clear names/labels such as
+`New Password` and `Re-Type New Password`, even with `autocomplete="off"`.
+Changes require a pair; signup also supports a single new-password field.
+Ambiguous, multi-form, hidden, disabled, read-only and OTP fields are refused.
+The entire target set is revalidated against the inspected element/form objects
+in an isolated browser world before any value is written. A failed validation
+writes nothing. Secrets travel only over the supervisor WebSocket, never CLI
+arguments or model-visible output.
+
+The tool does **not** click a button or call submit. Review the filled form before
+submitting. Normal input/change events are dispatched after all new-password
+assignments, so the site's own handlers may react or auto-submit. No browser
+integration can prevent a site from reading credentials filled into its own form.
+Ordinary saved login handles still cannot fill new-password/confirmation fields.
+The default login mode retains generated-login support for explicit
+`autocomplete="new-password"` fields; use the explicit modes for labeled forms
+and atomic multi-field password changes.
+
 ## Managing what's saved
 
 - **Desktop → Settings → Passwords & Logins**: everything saved, the detected
