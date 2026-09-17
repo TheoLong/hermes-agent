@@ -248,7 +248,9 @@ def select_new_password_fields(
     """
     passwords = [c for c in controls if c.type == "password"]
     forms = {c.form_index for c in passwords}
-    if not passwords or len(forms) != 1 or None in forms or any(not c.fillable for c in passwords):
+    # SPAs may omit <form>; their complete document-level password set must
+    # still resolve to exactly one unambiguous operation below.
+    if not passwords or len(forms) != 1 or any(not c.fillable for c in passwords):
         raise ValueError("Expected one visible, enabled password form; hidden, disabled or multiple forms are refused.")
     selected = []
     roles = []
@@ -489,12 +491,19 @@ _FILL_JS_TEMPLATE = """(() => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
     if (!setter || !setter.set) return refuse();
     for (let i = 0; i < fills.length; i++) setter.set.call(targets[i], fills[i].value);
-    cleanup();
-    // Page callbacks cannot redirect later writes: all native assignments are complete.
-    for (const el of targets) {
+    for (let i = 0; i < targets.length; i++) {
+      // Controlled UIs can reset sibling values when each input event updates state.
+      // Revalidate retained nodes before restoring that input's intended value.
+      if (fills.some((f, j) => resolve(f) !== targets[j])) {
+        cleanup();
+        return JSON.stringify({ refused: "page_changed_during_events", filled: i });
+      }
+      const el = targets[i];
+      setter.set.call(el, fills[i].value);
       el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
     }
+    cleanup();
     return JSON.stringify({ filled: targets.length });
   }
   for (let i = 0; i < fills.length; i++) {
