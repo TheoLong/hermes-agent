@@ -526,11 +526,24 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
 
 
-def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool) -> Optional[str]:
+def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
+                   profile: str = "") -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
     BEFORE provider resolution so a hit short-circuits the cloud path via the BU_CDP_* env contract. Named
     sessions compose with the backend: BU_NAME namespaces the harness daemon (IPC socket, log, pid) and on
-    provider backends additionally keys its own cloud browser."""
+    provider backends additionally keys its own cloud browser.
+
+    ``profile`` names a ``browser.profiles`` entry and wins over every other route: it is an
+    explicit "drive THIS browser identity" instruction, so an unknown name is an error rather
+    than a silent fall back to the default endpoint (crossing an account boundary is exactly
+    what the named-profile feature exists to prevent)."""
+    if profile:
+        from tools.browser_tool import _resolve_profile_cdp
+        try:
+            _set_cdp_env(env, _resolve_profile_cdp(profile))
+        except ValueError as e:
+            return str(e)
+        return None
     rp_err = _resolve_real_profile_cdp(env, force_local=local)
     if rp_err:
         return rp_err
@@ -625,7 +638,7 @@ def stop_harness_daemons() -> None:
 
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False):
+                 task_id: Optional[str] = None, local: bool = False, profile: str = ""):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
@@ -641,13 +654,22 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error("browser-harness is missing from Hermes's Python environment. "
                           "Run `hermes update` to re-sync it.")
 
+    profile = (profile or "").strip()
+    if profile and not _SESSION_RE.match(profile):
+        return tool_error(f"Invalid profile name {profile!r}: use 1-64 letters, digits, dashes, or underscores.")
+
     env = _base_subprocess_env()
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
                               "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
-    route_err = _route_backend(env, session, task_id, bool(local))
+    # A harness daemon caches the endpoint it was started with, so a daemon name must never be
+    # shared across profiles — reusing one would silently drive the PREVIOUS profile's browser,
+    # which is the account-boundary bug named profiles exist to prevent.
+    if profile:
+        env["BU_NAME"] = f"{session}-profile-{profile}" if session else f"profile-{profile}"
+    route_err = _route_backend(env, session, task_id, bool(local), profile)
     if route_err:
         return tool_error(route_err)
     bot_desktop_browser = bool(env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None))
@@ -812,6 +834,7 @@ BROWSER_EXEC_SCHEMA = {
         "properties": {
             "code": {"type": "string", "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."},
             "session": {"type": "string", "description": "Named isolated browser session — its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
+            "profile": {"type": "string", "description": "Named browser identity from config `browser.profiles` (e.g. the user's own logged-in Chrome vs the agent's). Binds this call to that profile's CDP endpoint; reuse the same name on every related call. Omit for the default browser. An unknown name is an error — it never silently falls back to the default."},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
                           "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
         },
@@ -832,7 +855,7 @@ registry.register(
     handler=lambda args, **kw: browser_exec(
         code=args.get("code", ""), session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
-        local=bool(args.get("local", False)),
+        local=bool(args.get("local", False)), profile=args.get("profile", "") or "",
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
