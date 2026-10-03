@@ -115,7 +115,12 @@ def resolve_store_python(repo_root: Path) -> Path | None:
         except (OSError, ValueError):
             entry = None
         if entry:
-            candidate = runtime / entry / rel
+            # Launchers live in the shared install tree and outlive the process that
+            # minted them: anchor on the store's real directory, never a path through a
+            # caller's HOME (a sandbox HOME whose tools/ symlinks to the real store would
+            # bake a temp path into the install launcher). The interpreter file itself
+            # stays unresolved: it may legitimately be a symlink to its base Python.
+            candidate = runtime.resolve() / entry / rel
             if candidate.is_file():
                 return candidate
 
