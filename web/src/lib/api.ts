@@ -109,8 +109,6 @@ const PROFILE_SCOPED_PREFIXES = [
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
   "/api/pairing",
-  // Each profile has its own encrypted vault; DELETE is a destructive route.
-  "/api/vault",
   // Memory files, the curator state file, webhook subscriptions, shell hooks,
   // checkpoints, backups/imports and the dashboard's own theme/font/plugin
   // preferences all live in a profile home. One backend now serves every
@@ -1242,31 +1240,6 @@ export const api = {
       method: "POST",
     }),
 
-  // ── Admin: Credential vault ─────────────────────────────────────────
-  getVaultItems: () => fetchJSON<{ items: VaultItem[] }>("/api/vault/items"),
-  getVaultSources: () => fetchJSON<{ sources: VaultSource[] }>("/api/vault/sources"),
-  addVaultItem: (body: VaultItemCreate) =>
-    fetchJSON<{ item: VaultItem }>("/api/vault/items", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  revealVaultItem: (id: string) =>
-    fetchJSON<{ secret: Record<string, string> }>(
-      `/api/vault/items/${encodeURIComponent(id)}/secret`,
-      { cache: "no-store" },
-    ),
-  updateVaultItem: (id: string, body: VaultItemUpdate) =>
-    fetchJSON<{ item: VaultItem }>(`/api/vault/items/${encodeURIComponent(id)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  removeVaultItem: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/api/vault/items/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-    }),
-
   // ── Admin: Webhooks ─────────────────────────────────────────────────
   getWebhooks: () => fetchJSON<WebhooksResponse>("/api/webhooks"),
   enableWebhooks: () =>
@@ -1765,46 +1738,6 @@ export interface PairingUser {
 export interface PairingResponse {
   pending: PairingUser[];
   approved: PairingUser[];
-}
-
-export type VaultKind = "login" | "payment" | "address";
-
-export interface VaultItem {
-  id: string;
-  kind: VaultKind;
-  label: string;
-  origin: string | null;
-  created_at: string;
-  identifier_type?: "email" | "phone" | "username";
-  identifier?: string;
-  has_otp?: boolean;
-  generated?: boolean;
-  allowed_origins?: string[];
-  backend: string;
-}
-
-export interface VaultSource {
-  name: string;
-  display_name: string;
-  enabled: boolean;
-  needs_unlock: boolean;
-  unlocked: boolean;
-  installed: boolean;
-}
-
-export interface VaultItemUpdate {
-  label?: string;
-  origin?: string;
-  identifier?: string;
-  identifier_type?: string;
-  secret?: Record<string, string>;
-}
-
-export interface VaultItemCreate {
-  kind: VaultKind;
-  label: string;
-  origin?: string;
-  secret: Record<string, string>;
 }
 
 export interface WebhookRoute {

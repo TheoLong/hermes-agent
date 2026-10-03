@@ -220,7 +220,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
-  { path: "/vault", label: "Vault", icon: LockKeyhole },
+  { path: "/vault", label: "Passwords", icon: LockKeyhole },
   { path: "/system", label: "System", icon: Wrench },
   {
     path: "/docs",
