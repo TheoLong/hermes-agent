@@ -35,6 +35,7 @@ import {
   Globe,
   Heart,
   KeyRound,
+  LockKeyhole,
   Menu,
   MessageSquare,
   Package,
@@ -96,6 +97,7 @@ const McpPage = lazy(() => import("@/pages/McpPage"));
 const PairingPage = lazy(() => import("@/pages/PairingPage"));
 const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
+const VaultPage = lazy(() => import("@/pages/VaultPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
 const ChatPage = lazy(() => import("@/pages/ChatPage"));
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
@@ -175,6 +177,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/profiles/new": ProfileBuilderPage,
   "/config": ConfigPage,
   "/env": EnvPage,
+  "/vault": VaultPage,
   "/docs": DocsPage,
 };
 
@@ -217,6 +220,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
+  { path: "/vault", label: "Vault", icon: LockKeyhole },
   { path: "/system", label: "System", icon: Wrench },
   {
     path: "/docs",
