@@ -29,6 +29,7 @@ the pre-rebase originals of these carries, kept until the rebased stack is trust
 
 | `7c6d1b7440e` | feat(browser): honor named browser profiles in browser_exec | none (local-only) | medium | Threads `profile=` through `browser_exec` to the same `browser.profiles` resolution as `browser_navigate`. Applied clean this sync. |
 | `b2d23751119` | chore(models): refresh Copilot picker list (2026-10-02) | none (local-only) | low | Stacks on the 2026-09-13 refresh in `hermes_cli/models_catalog_static.py`. |
+| `c95d4972a35` | feat(dashboard): Vault page to manage saved logins, cards and addresses | none yet (no upstream issue or PR as of 2026-10-03) | medium | New files `hermes_cli/web_routers/vault.py` + `web/src/pages/VaultPage.tsx`; two-line mount in `hermes_cli/web_server.py` router list, nav/route lines in `web/src/App.tsx`, `/api/vault` in `PROFILE_SCOPED_PREFIXES` + client in `web/src/lib/api.ts`. Conflicts are additive list collisions. Rebuild `web_dist` (`cd web && npm run build`) after every sync or the page 404s. Password managers are status-only by design (unlock token is per-process). |
 
 ---
 
