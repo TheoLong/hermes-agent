@@ -50,6 +50,7 @@ const FIELDS: Record<Exclude<VaultKind, "login">, FieldSpec[]> = {
 
 const KIND_ICON = { login: KeyRound, payment: CreditCard, address: MapPin } as const;
 const KIND_TITLE = { login: "Logins", payment: "Cards", address: "Addresses" } as const;
+const ADD_LABEL = { login: "Add login", payment: "Add card", address: "Add address" } as const;
 
 function emptyForm() {
   return {
@@ -423,10 +424,23 @@ export default function VaultPage() {
         const Icon = KIND_ICON[kind];
         return (
           <div key={kind} className="flex flex-col gap-3">
-            <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
-              <Icon className="h-4 w-4" />
-              {KIND_TITLE[kind]} ({rows.length})
-            </H2>
+            <div className="flex items-center justify-between gap-2">
+              <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+                <Icon className="h-4 w-4" />
+                {KIND_TITLE[kind]} ({rows.length})
+              </H2>
+              <Button
+                ghost
+                size="sm"
+                onClick={() => {
+                  setForm({ ...emptyForm(), kind });
+                  setModalOpen(true);
+                }}
+                prefix={<Plus className="h-4 w-4" />}
+              >
+                {ADD_LABEL[kind]}
+              </Button>
+            </div>
             {rows.length === 0 && (
               <Card>
                 <CardContent className="py-6 text-center text-sm text-muted-foreground">
