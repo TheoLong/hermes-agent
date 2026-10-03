@@ -19,6 +19,7 @@ export function MultiplexStandaloneBanner({
 }) {
   const { t } = useI18n();
   const reason = status?.multiplex_standalone_reason ?? null;
+  const [expanded, setExpanded] = useState(false);
   const [dismissed, setDismissed] = useState<string | null>(() => {
     try {
       return sessionStorage.getItem(STORAGE_KEY);
@@ -49,10 +50,24 @@ export function MultiplexStandaloneBanner({
     <div
       role="alert"
       data-testid="multiplex-standalone-banner"
-      className="flex items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-300"
+      className="flex items-start gap-2 border-b border-amber-500/40 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-300"
     >
-      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-      <span className="min-w-0 flex-1">{message}</span>
+      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      {/* The reason concatenates one paragraph per unserved profile; unclamped it can
+          fill a phone screen and hide the page underneath. */}
+      <span
+        data-testid="multiplex-standalone-banner-text"
+        className={`min-w-0 flex-1 break-words ${expanded ? "max-h-[40vh] overflow-y-auto" : "line-clamp-2"}`}
+      >
+        {message}
+      </span>
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="shrink-0 underline opacity-80 hover:opacity-100"
+      >
+        {expanded ? "Less" : "Details"}
+      </button>
       <button
         type="button"
         aria-label={t.app.dismiss ?? "Dismiss"}
