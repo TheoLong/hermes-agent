@@ -8,6 +8,8 @@ const apiMocks = vi.hoisted(() => ({
   getVaultItems: vi.fn(),
   getVaultSources: vi.fn(),
   addVaultItem: vi.fn(),
+  revealVaultItem: vi.fn(),
+  updateVaultItem: vi.fn(),
   removeVaultItem: vi.fn(),
 }));
 
@@ -124,5 +126,39 @@ describe("VaultPage", () => {
       secret: { identifier_type: "email", identifier: "op@example.com", password: "hunter2-not-real" },
     });
     await waitFor(() => document.getElementById("vault-password") === null);
+  });
+
+  it("opens an item with its secret and saves edits in place", async () => {
+    apiMocks.getVaultItems.mockResolvedValue({ items: [LOGIN] });
+    apiMocks.getVaultSources.mockResolvedValue({ sources: [] });
+    apiMocks.revealVaultItem.mockResolvedValue({ secret: { password: "stored-pass", otp_secret: "JBSWY3DP" } });
+    apiMocks.updateVaultItem.mockResolvedValue({ item: LOGIN });
+    await renderPage();
+    await waitFor(() => document.querySelector('button[aria-label="Open Amazon"]') !== null);
+
+    await act(async () => {
+      (document.querySelector('button[aria-label="Open Amazon"]') as HTMLButtonElement).click();
+    });
+    await waitFor(() => document.getElementById("vault-password") !== null);
+    expect(apiMocks.revealVaultItem).toHaveBeenCalledWith("vault_aaa");
+    const pw = document.getElementById("vault-password") as HTMLInputElement;
+    expect(pw.value).toBe("stored-pass");
+    expect(pw.type).toBe("password");
+    const show = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Show");
+    act(() => show!.click());
+    expect((document.getElementById("vault-password") as HTMLInputElement).type).toBe("text");
+
+    typeInto("vault-password", "changed-pass");
+    await act(async () => {
+      document.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    expect(apiMocks.addVaultItem).not.toHaveBeenCalled();
+    expect(apiMocks.updateVaultItem).toHaveBeenCalledWith("vault_aaa", {
+      label: "Amazon",
+      origin: "https://www.amazon.com",
+      identifier: "op@example.com",
+      identifier_type: "email",
+      secret: { password: "changed-pass", otp_secret: "JBSWY3DP" },
+    });
   });
 });

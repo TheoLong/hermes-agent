@@ -395,6 +395,80 @@ class VaultStore:
             self._write_all(remaining)
             return True
 
+    def update_item(
+        self,
+        item_id: str,
+        *,
+        label: Optional[str] = None,
+        origin: Optional[str] = None,
+        identifier: Optional[str] = None,
+        identifier_type: Optional[str] = None,
+        secret: Optional[Dict[str, Any]] = None,
+    ) -> VaultItemMeta:
+        """Edit an item in place; the id (and so every handle the agent holds) is kept.
+
+        ``None`` leaves a field unchanged. In ``secret``, a key with an empty value clears an
+        optional field (``otp_secret``, an optional card/address field); a required field
+        cannot be cleared. Kind and ``generated`` are immutable.
+        """
+        with self._locked():
+            items = self._read_all()
+            rec = next((r for r in items if r.get("id") == item_id), None)
+            if rec is None:
+                raise VaultError(f"no vault item with id {item_id!r}")
+            kind = str(rec.get("kind") or "")
+            new = dict(rec)
+            if label is not None:
+                if not label.strip():
+                    raise VaultError("label is required")
+                new["label"] = label.strip()
+            if origin is not None:
+                if not origin.strip():
+                    if kind == "login":
+                        raise VaultError("origin is required for login items")
+                    new["origin"] = None
+                else:
+                    new["origin"] = normalize_origin(origin)
+            if kind == "login":
+                if identifier_type is not None:
+                    if identifier_type not in LOGIN_IDENTIFIER_TYPES:
+                        raise VaultError(f"identifier_type must be one of {LOGIN_IDENTIFIER_TYPES}")
+                    new["identifier_type"] = identifier_type
+                if identifier is not None:
+                    if not identifier.strip():
+                        raise VaultError("login items require identifier and password")
+                    new["identifier"] = identifier.strip()
+            payload = dict(rec.get("secret") or {})
+            for key, value in (secret or {}).items():
+                value = "" if value is None else str(value)
+                if kind == "login":
+                    if key == "password":
+                        if not value:
+                            raise VaultError("login items require identifier and password")
+                        payload["password"] = value
+                    elif key == "otp_secret":
+                        otp = normalize_otp_secret(value) if value.strip() else ""
+                        if otp:
+                            payload["otp_secret"] = otp
+                        else:
+                            payload.pop("otp_secret", None)
+                    continue
+                allowed = PAYMENT_FIELDS if kind == "payment" else ADDRESS_FIELDS
+                if key not in allowed:
+                    continue
+                if value.strip():
+                    payload[key] = value
+                else:
+                    payload.pop(key, None)
+            if kind != "login":
+                missing = [f for f in REQUIRED_FIELDS[kind] if f not in payload]
+                if missing:
+                    raise VaultError(f"{kind} items require {', '.join(missing)}")
+            new["secret"] = payload
+            items[items.index(rec)] = new
+            self._write_all(items)
+            return self._meta(new)
+
     def get_meta(self, item_id: str) -> Optional[VaultItemMeta]:
         with self._locked():
             for rec in self._read_all():

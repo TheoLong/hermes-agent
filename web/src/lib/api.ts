@@ -1251,6 +1251,17 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  revealVaultItem: (id: string) =>
+    fetchJSON<{ secret: Record<string, string> }>(
+      `/api/vault/items/${encodeURIComponent(id)}/secret`,
+      { cache: "no-store" },
+    ),
+  updateVaultItem: (id: string, body: VaultItemUpdate) =>
+    fetchJSON<{ item: VaultItem }>(`/api/vault/items/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   removeVaultItem: (id: string) =>
     fetchJSON<{ ok: boolean }>(`/api/vault/items/${encodeURIComponent(id)}`, {
       method: "DELETE",
@@ -1779,6 +1790,14 @@ export interface VaultSource {
   needs_unlock: boolean;
   unlocked: boolean;
   installed: boolean;
+}
+
+export interface VaultItemUpdate {
+  label?: string;
+  origin?: string;
+  identifier?: string;
+  identifier_type?: string;
+  secret?: Record<string, string>;
 }
 
 export interface VaultItemCreate {

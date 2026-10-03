@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
-import { CreditCard, KeyRound, MapPin, Plus, Trash2, X } from "lucide-react";
+import { CreditCard, Eye, EyeOff, KeyRound, MapPin, Pencil, Plus, Trash2, X } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
@@ -78,6 +78,10 @@ export default function VaultPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState(emptyForm);
+  // null = adding; an id = viewing/editing that item (its secret was fetched on open).
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [showSecrets, setShowSecrets] = useState(false);
+  const [opening, setOpening] = useState<string | null>(null);
   const { toast, showToast } = useToast();
   const { setEnd } = usePageHeader();
 
@@ -98,8 +102,37 @@ export default function VaultPage() {
   // Secrets live in component state only while the dialog is open.
   const closeModal = useCallback(() => {
     setModalOpen(false);
+    setEditingId(null);
+    setShowSecrets(false);
     setForm(emptyForm());
   }, []);
+
+  const openItem = useCallback(
+    async (item: VaultItem) => {
+      setOpening(item.id);
+      try {
+        const { secret } = await api.revealVaultItem(item.id);
+        setForm({
+          ...emptyForm(),
+          kind: item.kind,
+          label: item.label,
+          origin: item.origin ?? "",
+          identifierType: item.identifier_type ?? "email",
+          identifier: item.identifier ?? "",
+          password: secret.password ?? "",
+          otp: secret.otp_secret ?? "",
+          fields: item.kind === "login" ? {} : { ...secret },
+        });
+        setEditingId(item.id);
+        setModalOpen(true);
+      } catch (e) {
+        showToast(`Could not open: ${errorMessage(e)}`, "error");
+      } finally {
+        setOpening(null);
+      }
+    },
+    [showToast],
+  );
   const modalRef = useModalBehavior({ open: modalOpen, onClose: closeModal });
 
   useLayoutEffect(() => {
@@ -130,6 +163,27 @@ export default function VaultPage() {
           );
     setSaving(true);
     try {
+      if (editingId) {
+        // Send every field of the kind so a field emptied in the form is cleared.
+        const editSecret =
+          form.kind === "login"
+            ? { password: form.password, otp_secret: form.otp.trim() }
+            : Object.fromEntries(
+                FIELDS[form.kind].map((f) => [f.key, (form.fields[f.key] ?? "").trim()]),
+              );
+        await api.updateVaultItem(editingId, {
+          label: form.label.trim(),
+          origin: form.origin.trim(),
+          ...(form.kind === "login"
+            ? { identifier: form.identifier.trim(), identifier_type: form.identifierType }
+            : {}),
+          secret: editSecret,
+        });
+        showToast(`Updated: "${form.label.trim()}"`, "success");
+        closeModal();
+        await load();
+        return;
+      }
       await api.addVaultItem({
         kind: form.kind,
         label: form.label.trim(),
@@ -214,7 +268,7 @@ export default function VaultPage() {
             </Button>
             <header className="p-5 pb-3 border-b border-border">
               <h2 id="vault-add-title" className="font-mondwest text-display text-base tracking-wider">
-                Add to vault
+                {editingId ? form.label || "Edit" : "Add to vault"}
               </h2>
             </header>
 
@@ -232,6 +286,7 @@ export default function VaultPage() {
                   <Select
                     id="vault-kind"
                     value={form.kind}
+                    disabled={editingId !== null}
                     onValueChange={(v) => set({ kind: v as VaultKind, fields: {} })}
                   >
                     <SelectOption value="login">Login</SelectOption>
@@ -292,7 +347,7 @@ export default function VaultPage() {
                     <Label htmlFor="vault-password">Password</Label>
                     <Input
                       id="vault-password"
-                      type="password"
+                      type={showSecrets ? "text" : "password"}
                       autoComplete="new-password"
                       value={form.password}
                       onChange={(e) => set({ password: e.target.value })}
@@ -302,7 +357,7 @@ export default function VaultPage() {
                     <Label htmlFor="vault-otp">Authenticator key (optional)</Label>
                     <Input
                       id="vault-otp"
-                      type="password"
+                      type={showSecrets ? "text" : "password"}
                       autoComplete="off"
                       placeholder="base32 secret or otpauth:// link"
                       value={form.otp}
@@ -320,7 +375,7 @@ export default function VaultPage() {
                       </Label>
                       <Input
                         id={`vault-${f.key}`}
-                        type={f.secret ? "password" : "text"}
+                        type={f.secret && !showSecrets ? "password" : "text"}
                         autoComplete={f.autoComplete ?? "off"}
                         placeholder={f.placeholder}
                         value={form.fields[f.key] ?? ""}
@@ -334,11 +389,20 @@ export default function VaultPage() {
               )}
 
               <p className="text-xs text-muted-foreground">
-                Saved encrypted on this machine. Hermes can fill it into a matching page,
-                but nothing here ever shows the secret again.
+                Saved encrypted on this machine. Hermes fills it into a matching page
+                without ever seeing the password.
               </p>
 
-              <div className="flex justify-end">
+              <div className="flex items-center justify-between gap-2">
+                <Button
+                  type="button"
+                  ghost
+                  size="sm"
+                  onClick={() => setShowSecrets((v) => !v)}
+                  prefix={showSecrets ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                >
+                  {showSecrets ? "Hide" : "Show"}
+                </Button>
                 <Button
                   type="submit"
                   className="uppercase"
@@ -346,7 +410,7 @@ export default function VaultPage() {
                   disabled={saving}
                   prefix={saving ? <Spinner /> : undefined}
                 >
-                  {saving ? "Saving…" : "Save"}
+                  {saving ? "Saving…" : editingId ? "Save changes" : "Save"}
                 </Button>
               </div>
             </form>
@@ -373,7 +437,10 @@ export default function VaultPage() {
             {rows.map((item) => (
               <Card key={item.id}>
                 <CardContent className="flex items-center gap-4 py-3">
-                  <div className="flex-1 min-w-0">
+                  <div
+                    className={cn("flex-1 min-w-0", item.backend === "local" && "cursor-pointer")}
+                    onClick={() => item.backend === "local" && void openItem(item)}
+                  >
                     <div className="flex items-center gap-2 mb-1">
                       <span className="font-medium text-sm truncate">{item.label}</span>
                       {item.backend !== "local" && <Badge tone="outline">{item.backend}</Badge>}
@@ -384,6 +451,19 @@ export default function VaultPage() {
                       {itemSubtitle(item)}
                     </div>
                   </div>
+                  {item.backend === "local" && (
+                    <Button
+                      ghost
+                      size="icon"
+                      title="View / edit"
+                      aria-label={`Open ${item.label}`}
+                      disabled={opening === item.id}
+                      onClick={() => void openItem(item)}
+                      className="text-muted-foreground hover:text-foreground"
+                    >
+                      {opening === item.id ? <Spinner /> : <Pencil />}
+                    </Button>
+                  )}
                   {item.backend === "local" && (
                     <Button
                       ghost

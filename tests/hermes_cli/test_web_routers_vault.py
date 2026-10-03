@@ -167,3 +167,39 @@ def test_sources_lists_local_and_reports_managers_as_status(client):
     assert rows[0]["name"] == "local" and rows[0]["unlocked"] is True
     assert all({"name", "enabled", "installed", "unlocked"} <= set(r) for r in rows)
     json.dumps(rows)
+
+
+def test_reveal_returns_the_secret_uncached_for_local_items_only(client):
+    item_id = client.post("/api/vault/items", json=_login()).json()["item"]["id"]
+    r = client.get(f"/api/vault/items/{item_id}/secret")
+    assert r.status_code == 200
+    assert r.json()["secret"]["password"] == SECRET_PASSWORD
+    assert r.headers["cache-control"] == "no-store"
+    assert client.get("/api/vault/items/op:abc/secret").status_code == 400
+    assert client.get("/api/vault/items/vault_missing/secret").status_code == 404
+
+
+def test_edit_keeps_the_id_and_changes_only_what_was_sent(client):
+    from agent.vault_store import get_vault_store
+
+    item_id = client.post("/api/vault/items", json=_login()).json()["item"]["id"]
+    r = client.patch(f"/api/vault/items/{item_id}",
+                     json={"label": "Renamed", "secret": {"password": "New-pass-123", "otp_secret": ""}})
+    assert r.status_code == 200, r.text
+    assert "New-pass-123" not in r.text
+    item = r.json()["item"]
+    assert item["id"] == item_id and item["label"] == "Renamed"
+    assert item["identifier"] == "op@example.com" and not item.get("has_otp")
+    assert get_vault_store().resolve_secret(item_id) == {"password": "New-pass-123"}
+
+
+def test_edit_cannot_clear_a_required_field(client):
+    r = client.post("/api/vault/items", json={
+        "kind": "payment", "label": "Visa",
+        "secret": {"card_number": SECRET_CARD, "exp_month": "12", "exp_year": "2031", "cvc": SECRET_CVC}})
+    item_id = r.json()["item"]["id"]
+    bad = client.patch(f"/api/vault/items/{item_id}", json={"secret": {"cvc": ""}})
+    assert bad.status_code == 400
+    _no_secret(bad.text)
+    assert client.patch(f"/api/vault/items/{item_id}", json={"secret": {"password": ""}}).status_code == 200
+    assert client.patch("/api/vault/items/vault_missing", json={"label": "x"}).status_code == 404

@@ -6,8 +6,9 @@ The dashboard counterpart of the Desktop's Settings → Passwords & Logins panel
 
 Contracts:
 
-- Responses carry metadata only (``VaultItemMeta.to_dict``). No route ever returns a
-  password, card number, CVC, address line or authenticator seed.
+- Responses carry metadata only (``VaultItemMeta.to_dict``), except the one explicit
+  ``GET /api/vault/items/{id}/secret`` reveal the operator clicks for. Every reveal is
+  written to the log by item id (never value) and the response is ``Cache-Control: no-store``.
 - ``POST /api/vault/items`` accepts the secret payload once and writes it straight into the
   encrypted store; error text is scrubbed of submitted values before it leaves the handler,
   and the request body is never logged.
@@ -22,12 +23,29 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import logging
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli.web_routers._common import config_scoped_to_thread, destructive_profile
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+class VaultItemUpdate(BaseModel):
+    label: Optional[str] = None
+    origin: Optional[str] = None
+    identifier: Optional[str] = None
+    identifier_type: Optional[str] = None
+    secret: Dict[str, Any] = Field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return f"VaultItemUpdate(label={self.label!r}, origin={self.origin!r})"
+
+    __str__ = __repr__
 
 
 class VaultItemCreate(BaseModel):
@@ -125,3 +143,51 @@ async def remove_vault_item(item_id: str, profile: Optional[str] = None):
         return {"ok": True}
 
     return await config_scoped_to_thread(profile, _run)
+
+
+def _local_only(item_id: str) -> None:
+    if not item_id.startswith("vault_"):
+        raise HTTPException(status_code=400,
+                            detail="Only Hermes vault items can be viewed or edited here; use the password manager's own app.")
+
+
+@router.get("/api/vault/items/{item_id}/secret")
+async def reveal_vault_item(item_id: str, profile: Optional[str] = None):
+    """The decrypted payload of ONE local item, for the operator's Show button."""
+    _local_only(item_id)
+
+    def _run() -> dict:
+        from agent.vault_store import VaultError, get_vault_store
+
+        try:
+            return {"secret": get_vault_store().resolve_secret(item_id)}
+        except VaultError:
+            raise HTTPException(status_code=404, detail=f"No vault item {item_id}") from None
+
+    body = await config_scoped_to_thread(profile, _run)
+    logger.warning("vault: dashboard revealed item %s (profile=%s)", item_id, profile or "current")
+    return JSONResponse(body, headers={"Cache-Control": "no-store"})
+
+
+@router.patch("/api/vault/items/{item_id}")
+async def update_vault_item(item_id: str, body: VaultItemUpdate, profile: Optional[str] = None):
+    """Edit a local item in place; its id (the agent's handle) is unchanged."""
+    _local_only(item_id)
+    secret = dict(body.secret or {})
+
+    def _run() -> dict:
+        from agent.vault_store import VaultError, get_vault_store, scrub_secret_from_text
+
+        try:
+            meta = get_vault_store().update_item(
+                item_id, label=body.label, origin=body.origin, identifier=body.identifier,
+                identifier_type=body.identifier_type, secret=secret)
+        except VaultError as exc:
+            msg = scrub_secret_from_text(str(exc), secret)
+            raise HTTPException(status_code=404 if msg.startswith("no vault item") else 400, detail=msg) from None
+        return {"item": {**meta.to_dict(), "backend": "local"}}
+
+    try:
+        return await config_scoped_to_thread(profile, _run)
+    finally:
+        secret.clear()
