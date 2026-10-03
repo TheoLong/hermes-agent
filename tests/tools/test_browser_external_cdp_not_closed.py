@@ -1,13 +1,23 @@
-"""A CDP-attached browser is someone else's process — cleanup must not close it.
+"""An attached CDP browser is someone else's process — cleanup skips its ``close``.
 
-Regression for the externally-owned-Chrome kill: ``cleanup_browser`` sent the
-agent-browser ``close`` command to sessions created by attaching to a user-supplied
-CDP endpoint (``browser.cdp_url`` or a named ``browser.profiles`` entry). That command
-tears down the remote browser, killing a long-lived Chrome that Hermes never launched
-and that other sessions (and the user) are still using.
+``_create_cdp_session`` marks sessions that ATTACH to a user-supplied endpoint
+(``browser.cdp_url`` or a named ``browser.profiles`` entry) with
+``features={"cdp_override": True}``. Hermes did not launch those browsers, so it
+skips the ``agent-browser close`` round-trip for them and only releases its own
+local resources.
 
-Hermes only owns a browser it spawned itself. Attached endpoints get their local
-resources released, never a ``close``.
+SCOPE — what this does and does NOT claim:
+
+Measured against a real attached Chrome, sending ``close`` to an attached CDP
+endpoint does NOT kill the browser: agent-browser reports ``{"closed": true}``
+and the browser stays up with its tab count unchanged. Upstream issues #103591
+and #106601 document the same property from the opposite direction (attached
+browsers are *never* torn down by session cleanup, which they consider a leak).
+
+So this is a redundant-work and intent-clarity change, NOT a fix for a browser
+being killed. It removes a no-op round-trip on a shared endpoint and makes the
+ownership rule explicit in code. The tests below pin that ownership contract:
+attached endpoints are skipped, Hermes-launched browsers are still closed.
 """
 
 import pytest
@@ -51,14 +61,14 @@ def _install_spies(monkeypatch):
 
 
 def test_cdp_attached_session_is_not_closed(monkeypatch):
-    """A global ``browser.cdp_url`` attach is an external browser — never close it."""
+    """A global ``browser.cdp_url`` attach is an external browser — don't close it."""
     closed, released = _install_spies(monkeypatch)
     _track("t1", {"session_name": "cdp_abc", "bb_session_id": None,
                   "cdp_url": "http://localhost:9224", "features": {"cdp_override": True}})
 
     lifecycle.cleanup_browser("t1")
 
-    assert closed == [], "cleanup closed a browser Hermes did not launch"
+    assert closed == [], "cleanup sent close to a browser Hermes did not launch"
     assert released == ["t1"], "cleanup must still release its own local resources"
 
 
@@ -71,7 +81,7 @@ def test_named_profile_session_is_not_closed(monkeypatch):
 
     lifecycle.cleanup_browser(key)
 
-    assert closed == [], "cleanup closed a named-profile browser Hermes did not launch"
+    assert closed == [], "cleanup sent close to a named-profile browser Hermes did not launch"
     assert released == [key]
 
 
@@ -88,7 +98,7 @@ def test_hermes_launched_session_is_still_closed(monkeypatch):
 
 
 def test_cleanup_all_spares_attached_but_closes_owned(monkeypatch):
-    """Shutdown fans out over every session: attached spared, owned closed."""
+    """Shutdown fans out over every session: attached skipped, owned closed."""
     closed, released = _install_spies(monkeypatch)
     _track("attached", {"session_name": "cdp_1", "bb_session_id": None,
                         "cdp_url": "http://localhost:9224", "features": {"cdp_override": True}})
