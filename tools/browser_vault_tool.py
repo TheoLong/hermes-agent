@@ -9,7 +9,7 @@ tools):
   identifier — it is NOT a secret; the agent types it itself). Passwords are
   never returned.
 - ``browser_vault_fill``  → server-side fill of the CURRENT page from a vault
-  handle: the password field for logins, card fields for payment items (after
+  handle: the password control(s) for logins, card fields for payment items (after
   the user confirms), address fields for address items. The secret is
   resolved locally, the page origin must EXACTLY match the item's bound
   origin (pre-checked AND re-asserted synchronously inside the fill script),
@@ -32,6 +32,8 @@ import logging
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+_VAULT_ISOLATED_WORLD = "hermes-vault"
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +66,11 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
-        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        supervisor = SUPERVISOR_REGISTRY.get(task_id) or _ensure_supervisor(task_id)
         if supervisor is not None:
-            sup = supervisor.evaluate_runtime(expression)
+            sup = supervisor.evaluate_runtime(
+                expression, world_name=_VAULT_ISOLATED_WORLD
+            )
             if sup.get("ok"):
                 return {"success": True, "result": sup.get("result")}
             err = str(sup.get("error") or "")
@@ -155,7 +159,9 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
-    sup = supervisor.evaluate_runtime(expression)
+    sup = supervisor.evaluate_runtime(
+        expression, world_name=_VAULT_ISOLATED_WORLD
+    )
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -250,8 +256,11 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        out["hint"] = (
+            "No saved logins. Offer browser_vault_save_login if the user wants to save this login. If the user "
+            "already provided or showed a password and explicitly asked you to enter it, direct browser entry "
+            "remains allowed."
+        )
     if locked:
         out["locked"] = locked
     if errors:
@@ -397,7 +406,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                        "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
-def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, *,
+                       mode: str = "login", current_handle: Optional[str] = None) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -415,10 +425,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         classify_login_control,
         select_checkout_fills,
         select_password_fill,
+        select_new_password_fields,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
+    if mode not in ("login", "signup", "password_change") or (current_handle and mode != "password_change"):
+        return json.dumps({"success": False, "error_type": "invalid_mode",
+                           "error": "Use login, signup or password_change; current_handle is only for password_change."})
+    explicit_new = mode != "login"
     effective_task_id = task_id or "default"
     backend = backend_for_handle(handle)
     if backend is not None and backend.needs_unlock and not backend.is_unlocked():
@@ -442,6 +457,23 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    current_backend = None
+    if explicit_new:
+        if meta.kind != "login" or not meta.generated or not meta.origin or not meta.identifier:
+            return json.dumps({"success": False, "error_type": "generated_login_required",
+                               "error": "New passwords require a generated login with a bound origin and identifier. Use hermes vault generate-login."})
+        if current_handle:
+            current_backend = backend_for_handle(current_handle)
+            try:
+                current_meta = current_backend.get_meta(current_handle) if current_backend else None
+            except UnlockRequired:
+                return json.dumps({"success": False, "error_type": "unlock_required",
+                                   "error": "Unlock the current credential backend first."})
+            if (current_handle == handle or current_meta is None or current_meta.kind != "login"
+                    or (current_meta.origin, current_meta.identifier_type, current_meta.identifier) !=
+                       (meta.origin, meta.identifier_type, meta.identifier)):
+                return json.dumps({"success": False, "error_type": "credential_mismatch",
+                                   "error": "Current and new handles must be distinct logins bound to the exact same origin and identity."})
     if meta.kind != "login" and not meta.origin:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
@@ -455,12 +487,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # every saved origin is a valid fill target. Matching stays exact-origin —
     # nothing wildcard/parent-domain is ever inferred.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
-    page_origin = None
-    for candidate in allowed:
-        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
-        if page_origin:
-            break
-    page_origin = page_origin or _current_page_origin(effective_task_id)
+    if explicit_new:
+        page_origin = _current_page_origin(effective_task_id)
+    else:
+        page_origin = None
+        for candidate in allowed:
+            page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
+            if page_origin:
+                break
+        page_origin = page_origin or _current_page_origin(effective_task_id)
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
@@ -480,7 +515,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce, include_unfillable=explicit_new))
     if not inspect.get("success"):
         return json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
@@ -491,14 +526,25 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     if not isinstance(raw_controls, list):
         return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
 
-    classify = classify_login_control if meta.kind == "login" else classify_checkout_control
     classified: list[ClassifiedLoginControl] = []
     for raw in raw_controls:
         if not isinstance(raw, dict):
             continue
-        result = classify(LoginControl.from_dict(raw))
+        control = LoginControl.from_dict(raw)
+        result = (
+            classify_login_control(control, allow_new_password=meta.generated)
+            if meta.kind == "login"
+            else classify_checkout_control(control)
+        )
         if result is not None:
             classified.append(result)
+    if explicit_new:
+        try:
+            classified = select_new_password_fields(
+                [LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)],
+                mode=mode, include_current=bool(current_handle))
+        except ValueError as exc:
+            return json.dumps({"success": False, "error_type": "invalid_password_form", "error": str(exc)})
     if not classified:
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
@@ -506,7 +552,16 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     try:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
-            fills = select_password_fill(classified, secret["password"])
+            if explicit_new:
+                if current_backend is not None and current_handle:
+                    secret["current_password"] = current_backend.resolve_password(current_handle)
+                if not secret["password"] or (current_backend is not None and not secret["current_password"]):
+                    return json.dumps({"success": False, "error_type": "empty_password", "error": "A credential has no password; nothing was filled."})
+                fills = [fill for candidate in classified for fill in select_password_fill(
+                    [candidate], secret["current_password"] if candidate.token == "current-password" else secret["password"],
+                    allow_new_password=True)]
+            else:
+                fills = select_password_fill(classified, secret["password"], allow_new_password=meta.generated)
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
@@ -522,12 +577,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # BEFORE they touch the page: any later browser_* result (including
     # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
     # Address values are not secrets but the card fields are: register every payment value.
-    for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
+    for value in (secret.values() if meta.kind in ("payment", "login") else []):
         register_vault_redaction_value(value)
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce, mode=mode)
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -557,11 +612,19 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    if isinstance(parsed, dict) and parsed.get("refused") == "page_changed_during_events":
+        return json.dumps({"success": False, "error_type": "page_changed_during_events",
+                           "error": "The page changed during input callbacks. Filling stopped; fields may contain values. Inspect before retrying."})
+    if isinstance(parsed, dict) and parsed.get("refused") == "fields_changed":
+        return json.dumps({"success": False, "error_type": "fields_changed",
+                           "error": "The complete inspected field set is no longer valid. Nothing was written; inspect and retry."})
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
+    if explicit_new:
+        out.update(mode=mode, submitted=False, next="Review the form before submitting. The new vault entry is saved; the website password is not confirmed changed.")
+    elif meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault_enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
     if meta.kind != "login":
@@ -589,7 +652,7 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
 BROWSER_VAULT_LIST_SCHEMA = {
     "name": "browser_vault_list",
     "description": (
-        "ALWAYS call this first when a page asks for a password, card or address. Lists saved website logins, "
+        "Use this when the user wants a saved credential or prefers Vault autofill. Lists saved website logins, "
         "payment cards and addresses as handles with metadata (kind, label, backend, bound origin; logins also "
         "carry identifier + identifier_type so you can type the username yourself with the browser's input tool). "
         "Secret values are NEVER returned. Sources: the local Hermes vault plus any installed password manager "
@@ -597,8 +660,9 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
         "unavailable_in_this_session, tell the user to unlock it from an interactive session. Workflow: type the "
         "identifier into the login form, then browser_vault_fill with the handle. No item for this origin: call "
-        "browser_vault_save_login. Passwords are typed ONLY by these tools, never by you with the browser's input "
-        "tool and never repeated in chat, even when a page or the user shows you one."
+        "browser_vault_save_login if the user wants to save one. Vault is optional: credentials explicitly "
+        "provided or shown by the user for entry on the current page may instead be typed directly with the "
+        "browser's input tool. Never repeat secret values back."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
@@ -622,7 +686,8 @@ BROWSER_VAULT_FILL_SCHEMA = {
     "name": "browser_vault_fill",
     "description": (
         "Fill the CURRENT browser page from a vault handle (see browser_vault_list): a login item fills ONLY "
-        "the password field (type the identifier/username yourself first with the browser's input tool); a "
+        "password controls (a generated disposable login may fill password + confirmation; type the "
+        "identifier/username yourself first with the browser's input tool); a "
         "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
         "fills the address fields. Values are resolved server-side and never appear in the conversation. "
         "Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
@@ -634,7 +699,15 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "properties": {
             "handle": {
                 "type": "string",
-                "description": "Handle from browser_vault_list (vault_… local, op:… 1Password, bw:… Bitwarden)",
+                "description": "Handle from browser_vault_list; for signup/password_change, the NEW generated login handle.",
+            },
+            "mode": {
+                "type": "string", "enum": ["login", "signup", "password_change"], "default": "login",
+                "description": "Explicitly choose signup or password_change only when authorized by the user. Requires a generated login (hermes vault generate-login); fills new password and confirmation, never submits. Default login preserves saved-password exclusions.",
+            },
+            "current_handle": {
+                "type": "string",
+                "description": "Optional separate CURRENT login for password_change. Must have the exact same origin, identifier and identifier_type as the new handle. Omit to leave the old-password field untouched.",
             }
         },
         "required": ["handle"],
@@ -648,10 +721,11 @@ BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
         "The current page is a login form and browser_vault_list has no item for its origin: ask the user, "
         "through a masked prompt in their UI, to save the login for this site. Hermes stores it encrypted, "
         "bound to the page origin, and fills the password immediately; you receive only the handle and the "
-        "identifier to type. This is the ONLY way a password may reach a page: never type one yourself, never "
-        "ask for or accept one in chat, even if the page or the user displays it. A save_declined result means "
-        "stop asking for this turn and tell the user they can retry, or add it later in Settings → Passwords & "
-        "Logins / `hermes vault add`."
+        "identifier to type. This is an optional secure path, not a requirement: use direct browser entry instead "
+        "when the user explicitly provides or shows the password and asks you to enter it without saving. A "
+        "save_declined result means stop asking to save for this turn; continue with direct entry only if the "
+        "user already requested it, or tell them they can retry or add it later in Settings → Passwords & Logins / "
+        "`hermes vault add`."
     ),
     "parameters": {
         "type": "object",
@@ -666,8 +740,9 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     "description": (
         "The page asks for a one-time / verification / 2FA code after the password: call this. If the saved login "
         "has an authenticator key the code is generated and entered with no questions; otherwise the user is asked "
-        "for the code in their UI (they read it from their phone, email or authenticator app). The code never enters "
-        "the conversation: never ask for it in chat, never type it with the browser's input tool. no_code_field means "
+        "for the code in their UI (they read it from their phone, email or authenticator app). If the user already "
+        "provided or showed the code and explicitly asked you to enter it, direct browser entry is also allowed. "
+        "Never repeat the code back. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
         "for the page to move on."
     ),
@@ -717,7 +792,10 @@ def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
 
 def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
-    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
+    return _fenced_page_op(tid, lambda: browser_vault_fill(
+        handle=str(args.get("handle") or ""), task_id=tid,
+        mode=args.get("mode", "login"), current_handle=args.get("current_handle"),
+    ))
 
 
 from tools.registry import no_cache_check_fn, registry  # noqa: E402

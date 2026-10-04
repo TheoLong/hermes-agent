@@ -171,9 +171,10 @@ class VaultItemMeta:
     # ``origin`` is the first/primary one). Fill matching stays exact-origin against
     # this list — no wildcard or subdomain inference is ever derived from it.
     allowed_origins: tuple = ()
+    generated: bool = False  # safe to fill into an explicit new-password control for disposable QA
 
     def to_dict(self) -> Dict[str, Any]:
-        out = {
+        out: Dict[str, Any] = {
             "id": self.id,
             "kind": self.kind,
             "label": self.label,
@@ -187,6 +188,8 @@ class VaultItemMeta:
             out["has_otp"] = True
         if len(self.allowed_origins) > 1:
             out["allowed_origins"] = list(self.allowed_origins)
+        if self.generated:
+            out["generated"] = True
         return out
 
 
@@ -307,6 +310,7 @@ class VaultStore:
         label: str,
         secret: Dict[str, Any],
         origin: Optional[str] = None,
+        generated: bool = False,
     ) -> VaultItemMeta:
         """Add an item. ``secret`` is the sensitive payload (encrypted at rest).
 
@@ -361,6 +365,7 @@ class VaultStore:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "identifier_type": identifier_type,
             "identifier": identifier,
+            "generated": bool(generated) if kind == "login" else False,
             "secret": dict(secret),
         }
         with self._locked():
@@ -421,6 +426,7 @@ class VaultStore:
             identifier_type=rec.get("identifier_type") if identifier else None,
             identifier=identifier or None,
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
+            generated=bool(rec.get("generated", False)),
         )
 
 
