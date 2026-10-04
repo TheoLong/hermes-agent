@@ -90,3 +90,10 @@ def test_gateway_owned_oneshot_session_takes_its_footprint_from_the_frozen_polic
                                              skills_dir_override=skills)
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")  # inherited by a daemon a -q client auto-started
     assert shape("cli") == ({"skill_manage", "skill_view"}, interactive)
+
+
+def test_skills_guidance_does_not_forbid_task_directed_skill_edits():
+    """A one-shot whose task IS editing skills (scheduled skill audit) must not be told it may not."""
+    from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE as g
+    assert "on your own initiative" in g
+    assert "task itself is to edit skill files" in g
