@@ -601,14 +601,26 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
 
 
 def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
-                   force_local_sidecar: bool = False, real_profile: bool = True) -> Optional[str]:
+                   force_local_sidecar: bool = False, real_profile: bool = True, profile: str = "") -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
     BEFORE provider resolution so a hit short-circuits the cloud path via the BU_CDP_* env contract. Named
     sessions compose with the backend: BU_NAME namespaces the harness daemon (IPC socket, log, pid) and on
     provider backends additionally keys its own cloud browser.
 
     ``force_local_sidecar`` (a call carrying a private URL) declines the cloud provider for the hybrid local
-    sidecar; unlike ``local`` (the consent-gated real-profile browser) it never touches the user's profile."""
+    sidecar; unlike ``local`` (the consent-gated real-profile browser) it never touches the user's profile.
+
+    ``profile`` names a ``browser.profiles`` entry and wins over every other route: it is an
+    explicit "drive THIS browser identity" instruction, so an unknown name is an error rather
+    than a silent fall back to the default endpoint (crossing an account boundary is exactly
+    what the named-profile feature exists to prevent)."""
+    if profile:
+        from tools.browser_tool import _resolve_profile_cdp
+        try:
+            _set_cdp_env(env, _resolve_profile_cdp(profile))
+        except ValueError as e:
+            return str(e)
+        return None
     # ``real_profile=False``: this route already fell back, so it stays on its fresh browser instead
     # of swapping browsers mid-task once the profile frees up.
     rp_err = _resolve_real_profile_cdp(env, force_local=local) if real_profile else None
@@ -718,12 +730,12 @@ def stop_harness_daemons() -> None:
 
 
 def _route_exec(env: dict, session: str, task_id: Optional[str], local: bool, local_sidecar: bool,
-                route_key: str) -> tuple[Optional[str], bool]:
+                route_key: str, profile: str = "") -> tuple[Optional[str], bool]:
     """``_route_backend`` for one browser_exec call; returns ``(error, runs on the local sidecar)``.
     A real-profile fallback is remembered per route: the route keeps its fresh browser and the note
     waits until a result carries it (``_take_real_profile_note``)."""
     route_err = _route_backend(env, session, task_id, local, force_local_sidecar=local_sidecar,
-                               real_profile=route_key not in _real_profile_fallback)
+                               real_profile=route_key not in _real_profile_fallback, profile=profile)
     note = env.pop(_REAL_PROFILE_FALLBACK_SENTINEL, None)
     if note:
         _real_profile_fallback.setdefault(route_key, note)
@@ -739,7 +751,7 @@ def _take_real_profile_note(route_key: str) -> dict:
 
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False):
+                 task_id: Optional[str] = None, local: bool = False, profile: str = ""):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
@@ -761,13 +773,22 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error("browser-harness is missing from Hermes's Python environment. "
                           "Run `hermes update` to re-sync it.")
 
+    profile = (profile or "").strip()
+    if profile and not _SESSION_RE.match(profile):
+        return tool_error(f"Invalid profile name {profile!r}: use 1-64 letters, digits, dashes, or underscores.")
+
     env = _base_subprocess_env()
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
                               "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
-    route_err, local_sidecar = _route_exec(env, session, task_id, bool(local), local_sidecar, route_key)
+    # A harness daemon caches the endpoint it was started with, so a daemon name must never be
+    # shared across profiles — reusing one would silently drive the PREVIOUS profile's browser,
+    # which is the account-boundary bug named profiles exist to prevent.
+    if profile:
+        env["BU_NAME"] = f"{session}-profile-{profile}" if session else f"profile-{profile}"
+    route_err, local_sidecar = _route_exec(env, session, task_id, bool(local), local_sidecar, route_key, profile)
     if route_err:
         return tool_error(route_err)
     if local_sidecar:
@@ -937,6 +958,7 @@ BROWSER_EXEC_SCHEMA = {
         "properties": {
             "code": {"type": "string", "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."},
             "session": {"type": "string", "description": "Named isolated browser session — its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
+            "profile": {"type": "string", "description": "Named browser identity from config `browser.profiles` (e.g. the user's own logged-in Chrome vs the agent's). Binds this call to that profile's CDP endpoint; reuse the same name on every related call. Omit for the default browser. An unknown name is an error — it never silently falls back to the default."},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
                           "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
         },
@@ -957,7 +979,7 @@ registry.register(
     handler=lambda args, **kw: browser_exec(
         code=args.get("code", ""), session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
-        local=bool(args.get("local", False)),
+        local=bool(args.get("local", False)), profile=args.get("profile", "") or "",
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
