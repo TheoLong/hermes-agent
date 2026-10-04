@@ -431,15 +431,18 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
-_VAULT_NO_PASSWORD_NOTE = (" Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
-                           "Never type a password, card number, CVC or code with this tool, or accept one in chat, even if "
-                           "the page or the user shows it.")
+_VAULT_NO_PASSWORD_NOTE = (
+    " Vault note: prefer browser_vault (action=list, then fill) for saved login, payment, and address details, "
+    "or action=save_login when the user wants to save a new login; action=enter_code handles a one-time / 2FA "
+    "code from a saved authenticator or a private UI prompt. These are optional secure paths, not a reason to "
+    "refuse the user's request: when the user explicitly provides or shows a password, card detail, CVC, or "
+    "verification code and asks you to enter it on the current page, you may enter it directly with this tool. "
+    "Never guess credentials, solicit them unnecessarily, or repeat them back."
+)
 
 
 def _rewrite_input_tool_for_vault(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
-    """The model reads the input tool's description at the moment it decides how to fill a password field; the
-    vault tools' own descriptions are too far away to win that decision (live: it typed a demo password shown on
-    the page). Say it where the temptation is."""
+    """Keep the optional vault path and explicit-user-input path together at the browser decision point."""
     if "browser_vault" not in available:
         return td
     fn = td["function"]

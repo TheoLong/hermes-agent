@@ -8,7 +8,7 @@ paid per request) and available wherever a browser is. Its actions:
   identifier — it is NOT a secret; the agent types it itself). Passwords are
   never returned.
 - ``fill``  → server-side fill of the CURRENT page from a vault
-  handle: the password field for logins, card fields for payment items (after
+  handle: the password control(s) for logins (signup/password_change modes fill a generated login's new password + confirmation), card fields for payment items (after
   the user confirms), address fields for address items. The secret is
   resolved locally, the page origin must EXACTLY match the item's bound
   origin (pre-checked AND re-asserted synchronously inside the fill script),
@@ -29,6 +29,7 @@ autofill (kernel-login-autofill.ts / fill_from_vault.ts).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import secrets
 import logging
@@ -37,6 +38,8 @@ from typing import Any, Dict, Optional
 from tools.browser_vault_context import plugin_errors_as_refusal, saved_origins, snapshot_refusal, write_backend_code
 
 logger = logging.getLogger(__name__)
+
+_VAULT_ISOLATED_WORLD = "hermes-vault"
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +98,7 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
-    sup = supervisor.evaluate_runtime(expression)
+    sup = supervisor.evaluate_runtime(expression, world_name=_VAULT_ISOLATED_WORLD)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {"success": False, "error": str(sup.get("error") or "evaluate failed")}
@@ -167,7 +170,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
 
     if page is not None:
         return _page_eval(page, task_id, expression, secret=True)
-    sup = supervisor.evaluate_runtime(expression)
+    sup = supervisor.evaluate_runtime(expression, world_name=_VAULT_ISOLATED_WORLD)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -296,8 +299,11 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        out["hint"] = (
+            "No saved logins. Offer browser_vault action=save_login if the user wants to save this login. If the "
+            "user already provided or showed a password and explicitly asked you to enter it, direct browser entry "
+            "remains allowed."
+        )
     if locked:
         out["locked"] = locked
     if errors:
@@ -463,7 +469,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
 
 @plugin_errors_as_refusal
-def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, *,
+                       mode: str = "login", current_handle: Optional[str] = None) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -473,6 +480,10 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     """
     from agent.vault_backends import UnlockRequired, backend_for_handle
 
+    if mode not in ("login", "signup", "password_change") or (current_handle and mode != "password_change"):
+        return json.dumps({"success": False, "error_type": "invalid_mode",
+                           "error": "Use login, signup or password_change; current_handle is only for password_change."})
+    explicit_new = mode != "login"
     effective_task_id = task_id or "default"
     backend = backend_for_handle(handle)
     if backend is not None and backend.needs_unlock and not backend.is_unlocked():
@@ -496,23 +507,60 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    current_backend = None
+    if explicit_new:
+        if meta.kind != "login" or not meta.generated or not meta.origin or not meta.identifier:
+            return json.dumps({"success": False, "error_type": "generated_login_required",
+                               "error": "New passwords require a generated login with a bound origin and identifier. Use hermes vault generate-login."})
+        if current_handle:
+            current_backend = backend_for_handle(current_handle)
+            try:
+                current_meta = current_backend.get_meta(current_handle) if current_backend else None
+            except UnlockRequired:
+                return json.dumps({"success": False, "error_type": "unlock_required",
+                                   "error": "Unlock the current credential backend first."})
+            if (current_handle == handle or current_meta is None or current_meta.kind != "login"
+                    or (current_meta.origin, current_meta.identifier_type, current_meta.identifier) !=
+                       (meta.origin, meta.identifier_type, meta.identifier)):
+                return json.dumps({"success": False, "error_type": "credential_mismatch",
+                                   "error": "Current and new handles must be distinct logins bound to the exact same origin and identity."})
+
     # Origin binding pre-check (the authoritative re-check runs inside the fill script), before the user is
     # asked to confirm a card, before the backend's fill_context is entered and before any value is resolved.
-    page_origin = _bound_page_origin(effective_task_id, meta, meta.kind)
-    if isinstance(page_origin, dict):
-        return json.dumps(page_origin)
+    # LOCAL CARRY: signup/password-change pages carry no login form to focus, so they bind on the plain
+    # current page origin, still required to be one of the item's saved origins.
+    if explicit_new:
+        allowed = saved_origins(meta)
+        page_origin = _current_page_origin(effective_task_id)
+        if not page_origin:
+            return json.dumps({"success": False,
+                               "error": "Could not determine the current page origin. Navigate to the page first."})
+        if page_origin not in allowed:
+            return json.dumps({"success": False, "error_type": "origin_mismatch",
+                               "error": (f"Refused: current page origin ({page_origin}) does not match the vault item's "
+                                         f"bound origin(s) ({', '.join(allowed)}).")})
+    else:
+        page_origin = _bound_page_origin(effective_task_id, meta, meta.kind)
+        if isinstance(page_origin, dict):
+            return json.dumps(page_origin)
     if meta.kind == "payment" and not _confirm_payment_fill(meta.label, page_origin):
         return json.dumps({"success": False, "error_type": "payment_declined",
                            "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
 
-    with backend.fill_context():
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(backend.fill_context())
+        if current_backend is not None and current_backend is not backend:
+            stack.enter_context(current_backend.fill_context())
         refusal = snapshot_refusal(backend, handle, meta, page_origin)
         if refusal is not None:
             return json.dumps(refusal)
-        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id)
+        return _fill_bound_page(backend, handle, meta, page_origin, effective_task_id,
+                                mode=mode, current_handle=current_handle, current_backend=current_backend)
 
 
-def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str) -> str:
+def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str, *,
+                     mode: str = "login", current_handle: Optional[str] = None,
+                     current_backend: Any = None) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
     after the origin guard passed."""
     from agent.redact import register_vault_redaction_value
@@ -524,14 +572,17 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
         classify_checkout_control,
         classify_login_control,
         select_checkout_fills,
+        select_new_password_fields,
         select_password_fill,
     )
     from agent.vault_backends import UnlockRequired
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
+    explicit_new = mode != "login"
+
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce, include_unfillable=explicit_new))
     if not inspect.get("success"):
         return json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
@@ -542,14 +593,25 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     if not isinstance(raw_controls, list):
         return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
 
-    classify = classify_login_control if meta.kind == "login" else classify_checkout_control
     classified: list[ClassifiedLoginControl] = []
     for raw in raw_controls:
         if not isinstance(raw, dict):
             continue
-        result = classify(LoginControl.from_dict(raw))
+        control = LoginControl.from_dict(raw)
+        result = (
+            classify_login_control(control, allow_new_password=meta.generated)
+            if meta.kind == "login"
+            else classify_checkout_control(control)
+        )
         if result is not None:
             classified.append(result)
+    if explicit_new:
+        try:
+            classified = select_new_password_fields(
+                [LoginControl.from_dict(raw) for raw in raw_controls if isinstance(raw, dict)],
+                mode=mode, include_current=bool(current_handle))
+        except ValueError as exc:
+            return json.dumps({"success": False, "error_type": "invalid_password_form", "error": str(exc)})
     if not classified:
         return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
 
@@ -557,7 +619,16 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     try:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
-            fills = select_password_fill(classified, secret["password"])
+            if explicit_new:
+                if current_backend is not None and current_handle:
+                    secret["current_password"] = current_backend.resolve_password(current_handle)
+                if not secret["password"] or (current_backend is not None and not secret["current_password"]):
+                    return json.dumps({"success": False, "error_type": "empty_password", "error": "A credential has no password; nothing was filled."})
+                fills = [fill for candidate in classified for fill in select_password_fill(
+                    [candidate], secret["current_password"] if candidate.token == "current-password" else secret["password"],
+                    allow_new_password=True)]
+            else:
+                fills = select_password_fill(classified, secret["password"], allow_new_password=meta.generated)
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
@@ -573,12 +644,12 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     # BEFORE they touch the page: any later browser_* result (including
     # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
     # Address values are not secrets but the card fields are: register every payment value.
-    for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
+    for value in (secret.values() if meta.kind in ("payment", "login") else []):
         register_vault_redaction_value(value)
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce, mode=mode)
         )
     except Exception as exc:  # health: allow BLE001 -- any CDP failure becomes a typed result; its text is scrubbed of the secret
         return json.dumps(
@@ -607,11 +678,19 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
                 ),
             }
         )
+    if isinstance(parsed, dict) and parsed.get("refused") == "page_changed_during_events":
+        return json.dumps({"success": False, "error_type": "page_changed_during_events",
+                           "error": "The page changed during input callbacks. Filling stopped; fields may contain values. Inspect before retrying."})
+    if isinstance(parsed, dict) and parsed.get("refused") == "fields_changed":
+        return json.dumps({"success": False, "error_type": "fields_changed",
+                           "error": "The complete inspected field set is no longer valid. Nothing was written; inspect and retry."})
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
+    if explicit_new:
+        out.update(mode=mode, submitted=False, next="Review the form before submitting. The new vault entry is saved; the website password is not confirmed changed.")
+    elif meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault action=enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
     if meta.kind != "login":
@@ -644,12 +723,14 @@ BROWSER_VAULT_SCHEMA = {
         "Actions: list (call first: saved logins/cards/addresses as handles; logins carry the identifier you type "
         "yourself with the browser's input tool; locked password managers appear under `locked`); fill (handle: "
         "the password for a login, card fields after the user confirms, address fields; refused unless the page "
-        "origin matches the item); save_login (nothing saved for this site: the user enters it in a masked prompt, "
-        "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
-        "authenticator key or asked of the user; no_code_field means approve on their device); unlock (backend: "
-        "ask the user to unlock 1Password/Bitwarden). Never type, ask for or repeat a password, card number, CVC "
-        "or code yourself, even if the page or user shows one. Stop on save_declined; never retry "
-        "payment_declined."
+        "origin matches the item; mode=signup/password_change fills a generated disposable login's new password "
+        "+ confirmation and never submits, only when the user authorized it); save_login (nothing saved for this "
+        "site: the user enters it in a masked prompt, Hermes saves and fills it); enter_code (a one-time/2FA code "
+        "after the password: generated from a saved authenticator key or asked of the user; no_code_field means "
+        "approve on their device); unlock (backend: ask the user to unlock 1Password/Bitwarden). Vault is optional: "
+        "credentials the user explicitly provides or shows for entry on the current page may be typed directly. "
+        "Never guess credentials, solicit them unnecessarily, or repeat them back. Stop on save_declined; never "
+        "retry payment_declined."
     ),
     "parameters": {
         "type": "object",
@@ -658,6 +739,14 @@ BROWSER_VAULT_SCHEMA = {
             "handle": {"type": "string", "description": "fill / enter_code: a handle from list."},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
+            "mode": {"type": "string", "enum": ["login", "signup", "password_change"], "default": "login",
+                     "description": "fill only. signup/password_change only when the user authorized it: requires a "
+                                    "generated login (hermes vault generate-login), fills new password + confirmation, "
+                                    "never submits."},
+            "current_handle": {"type": "string",
+                               "description": "fill + password_change only: separate CURRENT login with the same "
+                                              "origin, identifier and identifier_type. Omit to leave the old-password "
+                                              "field untouched."},
         },
         "required": ["action"],
     },
@@ -688,7 +777,8 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     if action == "unlock":
         return browser_vault_unlock(str(args.get("backend") or ""))
     page_ops = {
-        "fill": lambda: browser_vault_fill(handle=handle, task_id=tid),
+        "fill": lambda: browser_vault_fill(handle=handle, task_id=tid, mode=str(args.get("mode") or "login"),
+                                           current_handle=args.get("current_handle") or None),
         "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
         "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid),
     }
