@@ -63,3 +63,10 @@ def test_oneshot_delegation_budget_charges_total_children_then_refuses(oneshot, 
     # Interactive sessions are never charged, whatever the count.
     monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION")
     assert delegate_tool._oneshot_spawn_budget(parent, 50) is None
+
+
+def test_skills_guidance_does_not_forbid_task_directed_skill_edits():
+    """A one-shot whose task IS editing skills (scheduled skill audit) must not be told it may not."""
+    from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE as g
+    assert "on your own initiative" in g
+    assert "task itself is to edit skill files" in g
