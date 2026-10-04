@@ -330,7 +330,15 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> Dict[str, Any]:
 
 def _create_session_for_key(task_id: str, force_local: bool) -> Dict[str, Any]:
     """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
-    Precedence: CDP override > hybrid local sidecar (never real-profile) > cloud > local."""
+    Precedence: named profile > CDP override > hybrid local sidecar (never real-profile) > cloud > local."""
+    # A ``::profile:<name>`` key pins an explicit per-profile endpoint (its own persistent
+    # Chrome / cookie jar), so it wins over the global override AND bypasses cloud entirely —
+    # the whole point is that this task talks to that specific browser identity.
+    profile_name = _bt._profile_from_session_key(task_id)
+    if profile_name:
+        profile_cdp = _bt._resolve_profile_cdp(profile_name)
+        if profile_cdp:
+            return _create_cdp_session(task_id, profile_cdp)
     cdp_override = _cdp._get_cdp_override()
     if cdp_override and not force_local:
         return _create_cdp_session(task_id, cdp_override)
@@ -862,6 +870,81 @@ def _dispatch_browser_command(
     return engine, result
 
 
+def _dispatch_with_profile_tab(
+    task_id: str, session_info: Dict[str, Any], browser_cmd: str, command: str, args: List[str],
+    timeout: int, _engine_override: Optional[str],
+) -> "tuple[str, Dict[str, Any]]":
+    """LOCAL CARRY (named browser profiles): same-profile concurrency around one dispatch.
+
+    Two tasks on the SAME named profile share one Chrome and agent-browser drives its ACTIVE tab,
+    so hold the per-endpoint lock across activate-then-act with each session pinned to its own
+    labeled tab. Non-profile sessions and ``close`` go straight through, byte-identical to upstream.
+    """
+    profile_name = _bt._profile_from_session_key(task_id) if command != "close" else None
+    endpoint_url = session_info.get("cdp_url") if profile_name else None
+    if not endpoint_url:
+        return _dispatch_browser_command(task_id, session_info, browser_cmd, command, args, timeout, _engine_override)
+    with _bt._endpoint_lock_for(endpoint_url):
+        try:
+            tab_ref = _bt._ensure_owned_tab(task_id, session_info["session_name"], endpoint_url)
+            if tab_ref:
+                _bt._activate_owned_tab(session_info["session_name"], endpoint_url, tab_ref)
+        except Exception:
+            # Tab pinning is best-effort: degrade to un-pinned behaviour, never block the command.
+            _bt.logger.debug("profile tab activate failed for %s", task_id, exc_info=True)
+        return _dispatch_browser_command(task_id, session_info, browser_cmd, command, args, timeout, _engine_override)
+
+
+def _run_raw_agent_browser(
+    session_name: str,
+    cdp_url: str,
+    argv: List[str],
+    timeout: int = 15,
+) -> Dict[str, Any]:
+    """Run one agent-browser subcommand against ``cdp_url`` and parse its JSON.
+
+    A minimal sibling of :func:`_run_browser_command` used for the lightweight tab bookkeeping
+    calls (``tab new`` / ``tab <ref>``) that back same-profile isolation. Kept separate so it
+    never recurses through the profile-tab activation path (which would loop). Best-effort:
+    returns a dict with ``success`` and either ``data`` or ``error``.
+
+    Uses the same ``--session <name> --cdp <url>`` backend form as
+    :func:`_dispatch_browser_command`, so the tab it activates is the one that session's
+    daemon then acts on.
+    """
+    try:
+        browser_cmd = _install._find_agent_browser()
+    except FileNotFoundError as e:
+        return {"success": False, "error": str(e)}
+
+    if browser_cmd == "npx agent-browser":
+        cmd_prefix = [shutil.which("npx") or "npx", "agent-browser"]
+    else:
+        cmd_prefix = [browser_cmd]
+
+    cmd_parts = cmd_prefix + ["--session", session_name, "--cdp", cdp_url, "--json"] + argv
+
+    browser_env = _bt._build_browser_env()
+    browser_env["PATH"] = _install._merge_browser_path(browser_env.get("PATH", ""))
+    task_socket_dir = os.path.join(_bt._socket_safe_tmpdir(), f"agent-browser-{session_name}")
+    try:
+        os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+        browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+        proc = subprocess.run(
+            cmd_parts,
+            capture_output=True,
+            text=True,
+            env=browser_env,
+            timeout=timeout,
+        )
+        out = (proc.stdout or "").strip()
+        if not out:
+            return {"success": False, "error": (proc.stderr or "no output").strip()[:300]}
+        return json.loads(out)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+        return {"success": False, "error": str(e)}
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -887,7 +970,7 @@ def _run_browser_command(
         except Exception as e:
             _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
             return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
-        engine, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
+        engine, result = run_fenced_pair(session_info, lambda: _dispatch_with_profile_tab(
             task_id, session_info, browser_cmd, command, args, timeout, _engine_override))
         if result.get("code") == "human_has_control":
             return result
