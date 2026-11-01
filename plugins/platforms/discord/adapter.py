@@ -149,6 +149,8 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
         ("platform.discord.command.voice.choice_tts", "tts"), ("platform.discord.command.voice.choice_mode_off", "off"),
         ("platform.discord.command.voice.choice_status", "status"))),),
      "/voice {mode}", None),
+    ("join", "platform.discord.command.join.description", (), "/voice record", "platform.discord.command.join.followup"),
+    ("leave", "platform.discord.command.leave.description", (), "/voice leave", "platform.discord.command.leave.followup"),
     ("update", "slash.update.description", (), "/update", "platform.discord.command.update.followup"),
     ("restart", "platform.discord.command.restart.description", (), "/restart", "platform.discord.command.restart.followup"),
     ("approve", "slash.approve.description",
@@ -746,6 +748,9 @@ class VoiceReceiver:
         self._decode_failed = 0
         self._dave_unmapped_dropped = 0
         self._nacl_fail_streak = 0
+        # Meeting recorder (``/voice record``): when set, decoded PCM goes to it instead of the
+        # utterance buffers, so nothing is transcribed or answered live.
+        self._recorder = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1046,12 +1051,21 @@ class VoiceReceiver:
         if dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
-                if not user_id:
-                    # Rejoin race: SPEAKING may never be resent for a user who
-                    # was already talking — try the sole-member inference
-                    # before giving up on this frame.
+            if not user_id and dave_pver > 0:
+                # Discord may never send SPEAKING for people already talking when we join.
+                # Each sender's frames only decrypt with that sender's key, so try each
+                # unmapped group member: a successful decrypt identifies the speaker exactly.
+                probed = self._probe_dave_sender(ssrc, dave_session, decrypted)
+                if probed is not None:
+                    user_id, decrypted = probed
+                    dave_session = None  # already decrypted; skip the generic path below
+            with self._lock:
+                if not user_id and dave_session is not None and dave_pver <= 0:
+                    # Rejoin race without E2EE: SPEAKING may never be resent for a user who
+                    # was already talking — infer from the sole member. With E2EE on, only
+                    # the key probe above may identify a sender (a guess silences them).
                     user_id = self._infer_user_for_ssrc(ssrc)
-            if user_id:
+            if user_id and dave_session is not None:
                 try:
                     import davey
                     decrypted = dave_session.decrypt(
@@ -1060,9 +1074,19 @@ class VoiceReceiver:
                 except Exception as e:
                     # Unencrypted passthrough — use NaCl-decrypted data as-is
                     if "Unencrypted" not in str(e):
-                        if self._packet_debug_count <= 10:
-                            logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
-                        return
+                        # A wrong SSRC->user mapping fails every frame forever; let the key
+                        # find the real sender instead of silently dropping their audio.
+                        reprobed = self._probe_dave_sender(
+                            ssrc, dave_session, decrypted, exclude=frozenset({user_id}))
+                        if reprobed is not None:
+                            logger.info("Remapped ssrc=%d from user=%s after decrypt failure", ssrc, user_id)
+                            user_id, decrypted = reprobed
+                        else:
+                            self._dave_decrypt_failed = getattr(self, "_dave_decrypt_failed", 0) + 1
+                            if self._packet_debug_count <= 10 or self._dave_decrypt_failed % 500 == 1:
+                                logger.warning("DAVE decrypt failed for ssrc=%d (n=%d): %s",
+                                               ssrc, self._dave_decrypt_failed, e)
+                            return
             elif (
                 dave_pver > 0
                 and time.monotonic() >= self._dave_passthrough_until
@@ -1093,6 +1117,10 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             self._decode_ok += 1
+            recorder = self._recorder
+            if recorder is not None:
+                recorder.write(ssrc, pcm)
+                return
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
@@ -1101,6 +1129,43 @@ class VoiceReceiver:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
             return
+
+    DAVE_MAGIC = b"\xfa\xfa"  # trailer on every DAVE-encrypted frame; silence/passthrough frames lack it
+
+    def _probe_dave_sender(self, ssrc: int, dave_session, frame: bytes, exclude: frozenset = frozenset()):
+        """Identify an unmapped SSRC by trial DAVE decryption against each unmapped group member.
+
+        Returns ``(user_id, plaintext)`` and records the mapping on the first key that
+        authenticates, else None. A passthrough ("Unencrypted") result proves nothing about
+        the sender, so it never maps.
+        """
+        # Unencrypted frames (Opus silence, passthrough) "decrypt" under any key and would
+        # identify the wrong person, so only genuine ciphertext may be used as evidence.
+        if not bytes(frame).endswith(self.DAVE_MAGIC):
+            return None
+        try:
+            import davey
+            group = [int(u) for u in (dave_session.get_user_ids() or [])]
+        except Exception:
+            return None
+        bot_id = int(getattr(dave_session, "user_id", 0) or 0)
+        for uid in group:
+            if uid == bot_id or uid in exclude:
+                continue
+            try:
+                plain = dave_session.decrypt(uid, davey.MediaType.audio, frame)
+            except Exception:
+                continue
+            with self._lock:
+                # The key proves ownership: drop any stale guess that gave this user another SSRC.
+                for other, owner in list(self._ssrc_to_user.items()):
+                    if owner == uid and other != ssrc:
+                        del self._ssrc_to_user[other]
+                        self._decoders.pop(other, None)
+                self._ssrc_to_user[ssrc] = uid
+            logger.info("DAVE-probed ssrc=%d -> user=%d", ssrc, uid)
+            return uid, plain
+        return None
 
     # --- Silence detection ---
 
@@ -1112,10 +1177,15 @@ class VoiceReceiver:
             if not channel:
                 return 0
             bot_id = self._vc.user.id if self._vc.user else 0
-            allowed = self._allowed_user_ids
+            # While recording a meeting every member is a speaker, not just allowed users;
+            # filtering by the allowlist would hand a guest's SSRC to the owner.
+            allowed = None if self._recorder is not None else self._allowed_user_ids
+            # A user already mapped to another SSRC is not this SSRC's owner.
+            taken = {u for s, u in self._ssrc_to_user.items() if s != ssrc}
             candidates = [
                 m.id for m in channel.members
-                if m.id != bot_id and (not allowed or str(m.id) in allowed)
+                if m.id != bot_id and m.id not in taken
+                and (not allowed or str(m.id) in allowed)
             ]
             if len(candidates) == 1:
                 uid = candidates[0]
@@ -1171,6 +1241,10 @@ class VoiceReceiver:
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
         return completed
+
+    def ssrc_user_map(self) -> dict:
+        with self._lock:
+            return dict(self._ssrc_to_user)
 
     def discard_pending(self) -> None:
         """Drop buffered PCM that no poll or flush has emitted yet."""
@@ -1273,6 +1347,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._voice_timeout_seconds = self._load_voice_timeout()
         self._playback_timeout_seconds = self._load_playback_timeout()
         self._voice_receivers: dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
+        self._voice_recordings: dict[int, Any] = {}  # guild_id -> MeetingRecorder (/voice record)
         self._voice_listen_tasks: dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
@@ -1565,6 +1640,11 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 if guild_id not in bot_guild_ids:
                     return
                 if member == adapter_self._client.user:
+                    # Kicked/disconnected by someone: finish the recording and clean up.
+                    if (after.channel is None and before.channel is not None
+                            and guild_id in adapter_self._voice_recordings):
+                        logger.info("Bot was disconnected from voice in guild %d; stopping recording", guild_id)
+                        await adapter_self.leave_voice_channel(guild_id)
                     return
                 joined = before.channel is None and after.channel is not None
                 left = before.channel is not None and after.channel is None
@@ -3828,9 +3908,15 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             receiver = self._voice_receivers.pop(guild_id, None)
+            recorder = getattr(self, "_voice_recordings", {}).pop(guild_id, None)
+            speaker_map: dict = {}
             pending_inputs = []
             if receiver:
-                pending_inputs = receiver.flush_pending()
+                if recorder is not None:
+                    receiver._recorder = None
+                    speaker_map = receiver.ssrc_user_map()
+                else:
+                    pending_inputs = receiver.flush_pending()
                 receiver.stop()
             listen_task = self._voice_listen_tasks.pop(guild_id, None)
             if listen_task:
@@ -3854,8 +3940,68 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             task = self._voice_timeout_tasks.pop(guild_id, None)
             if task:
                 task.cancel()
-            self._voice_text_channels.pop(guild_id, None)
+            text_ch_id = self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+        if recorder is not None:
+            asyncio.ensure_future(self._finalize_recording(guild_id, recorder, speaker_map, text_ch_id))
+
+    async def start_recording(self, channel, *, text_channel_id: int | None = None) -> bool:
+        """Join *channel* silently and record every speaker until the bot leaves or is kicked."""
+        from plugins.platforms.discord.voice_recorder import MeetingRecorder
+        guild_id = channel.guild.id
+        if guild_id in self._voice_recordings:
+            return True
+        if not await self.join_voice_channel(channel, text_channel_id=text_channel_id):
+            return False
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver is None:
+            await self.leave_voice_channel(guild_id)
+            return False
+        recorder = await asyncio.to_thread(MeetingRecorder, f"{channel.guild.name}_{channel.name}")
+        receiver.discard_pending()
+        self._voice_recordings[guild_id] = recorder
+        receiver._recorder = recorder
+        self._cancel_voice_timeout(guild_id)  # a meeting may be silent for long stretches
+        logger.info("Recording voice channel %s (guild %d) to %s", channel.name, guild_id, recorder.dir)
+        return True
+
+    def is_recording(self, guild_id: int) -> bool:
+        return guild_id in self._voice_recordings
+
+    async def _finalize_recording(self, guild_id: int, recorder, speaker_map: dict, text_ch_id) -> None:
+        """Encode, mix and transcribe a finished recording, then report in the bound text channel."""
+        guild = self._client.get_guild(guild_id) if self._client is not None else None
+        names = {}
+        for ssrc, uid in speaker_map.items():
+            member = guild.get_member(uid) if guild is not None else None
+            names[ssrc] = member.display_name if member is not None else str(uid)
+        # Report to the owner's home channel, never the recorded server: /join needs no Send Messages there.
+        home = getattr(self.config, "home_channel", None)
+        home_id = int(home.chat_id) if home is not None and str(getattr(home, "chat_id", "")).isdigit() else None
+        ch = self._client.get_channel(home_id) if (self._client is not None and home_id) else None
+        try:
+            result = await asyncio.to_thread(recorder.finalize, names, resolve_ffmpeg_executable())
+        except Exception as e:
+            logger.warning("Meeting finalize failed: %s", e, exc_info=True)
+            result = {"dir": str(recorder.dir), "speakers": [], "mix": None, "transcript": None,
+                      "error": f"Processing failed: {e}"}
+        logger.info("Meeting recording finalized: %s", result)
+        if ch is None:
+            return
+        where = f" ({guild.name})" if guild is not None else ""
+        lines = [f"🎙️ Meeting recording{where} saved on von-braun: `{result['dir']}`"]
+        if result.get("speakers"):
+            lines.append("Speakers: " + ", ".join(result["speakers"]))
+        if result.get("error"):
+            lines.append(f"⚠️ {result['error']}")
+        files = []
+        tpath = result.get("transcript")
+        if tpath and os.path.getsize(tpath) < 8 * 1024 * 1024:
+            files.append(discord.File(tpath, filename="transcript.txt"))
+        try:
+            await ch.send("\n".join(lines), files=files or None)
+        except Exception as e:
+            logger.warning("Could not post meeting result: %s", e)
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
@@ -3950,6 +4096,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     def _reset_voice_timeout(self, guild_id: int) -> None:
         """Reset the auto-disconnect inactivity timer."""
         self._cancel_voice_timeout(guild_id)
+        if guild_id in getattr(self, "_voice_recordings", {}):
+            return  # recordings end only on leave/kick
         timeout = self._voice_timeout_limit()
         if timeout <= 0:
             logger.debug("Voice inactivity timeout disabled (guild=%d)", guild_id)
@@ -5191,6 +5339,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if parent_name:
             keys.add(parent_name)
             keys.add(f"#{parent_name}")
+        # Server ID too, so a gate list can name a whole server (snowflakes never collide with channel IDs).
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if guild_id is not None:
+            keys.add(str(guild_id))
         return keys
 
     def _discord_thread_require_mention(self) -> bool:

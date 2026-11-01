@@ -711,6 +711,8 @@ class GatewaySlashCommandsMixin(
             return await self._handle_voice_channel_join(event)
         if args == "leave":
             return await self._handle_voice_channel_leave(event)
+        if args == "record":
+            return await self._handle_voice_channel_record(event)
         if args == "status":
             mode = self._voice_mode.get(voice_key, "off")
             label = t(f"gateway.voice.label_{mode}") if mode in ("off", "voice_only", "all") else mode

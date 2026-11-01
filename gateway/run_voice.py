@@ -190,6 +190,29 @@ class GatewayVoiceMixin:
                                event.source.chat_id, "all")
         return t("gateway.voice.channel_joined", name=voice_channel.name)
 
+    async def _handle_voice_channel_record(self, event: MessageEvent) -> str:
+        """/voice record: join the caller's voice channel silently and record until leave/kick."""
+        adapter = self._delivery_adapter_for(event.source)
+        if not hasattr(adapter, "start_recording"):
+            return t("gateway.voice.channel_unsupported")
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            return t("gateway.voice.channel_guild_only")
+        voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
+        if not voice_channel:
+            return t("gateway.voice.channel_not_in_voice")
+        if adapter.is_in_voice_channel(guild_id) and not adapter.is_recording(guild_id):
+            return "I'm already in a voice call here in conversation mode. Run /voice leave first, then /voice record."
+        try:
+            ok = await adapter.start_recording(voice_channel, text_channel_id=int(event.source.chat_id))
+        except Exception as e:
+            logger.warning("Failed to start recording: %s", e)
+            return t("gateway.voice.channel_join_failed", error=e)
+        if not ok:
+            return t("gateway.voice.channel_join_permissions")
+        return (f"🔴 Recording **{voice_channel.name}**. Everything stays on von-braun. "
+                "Kick me from the call or run /voice leave to stop; I'll post the transcript here.")
+
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         adapter = self._delivery_adapter_for(event.source)
         guild_id = self._get_guild_id(event)
