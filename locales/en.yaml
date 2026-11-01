@@ -1150,6 +1150,12 @@ platform:
         arg_days: "Number of days to analyze (default: 7)"
       reload_skills:
         description: "Re-scan ~/.hermes/skills/ for new or removed skills"
+      join:
+        description: "Silently record your current voice channel"
+        followup: "🔴 Recording. /leave or kick me to stop; audio stays on von-braun."
+      leave:
+        description: "Stop recording and leave the voice channel"
+        followup: "⏹️ Stopped. Saving the recording on von-braun."
       voice:
         description: "Toggle voice reply mode"
         arg_mode: "Voice mode: join, channel, leave, on, tts, off, or status"
