@@ -521,7 +521,7 @@ def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
 
 
 def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
-                   force_local_sidecar: bool = False, real_profile: bool = True) -> Optional[str]:
+                   force_local_sidecar: bool = False, real_profile: bool = True, profile: str = "") -> Optional[str]:
     """Resolve where the harness connects; returns an error string or None. Real-profile consent runs
     BEFORE provider resolution so a hit short-circuits the cloud path via the BU_CDP_* env contract. Named
     sessions compose with the backend: BU_NAME namespaces the harness daemon (IPC socket, log, pid) and on
@@ -529,6 +529,19 @@ def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
 
     ``force_local_sidecar`` (a call carrying a private URL) declines the cloud provider for the hybrid local
     sidecar; unlike ``local`` (the consent-gated real-profile browser) it never touches the user's profile."""
+    # LOCAL CARRY (named browser profiles): ``profile`` names a ``browser.profiles`` entry and wins over
+    # every other route. An unknown name is an error, never a silent fall back to the default endpoint.
+    if profile:
+        from tools.browser_profiles import resolve_profile_cdp
+        try:
+            cdp = resolve_profile_cdp(profile)
+        except ValueError as e:
+            return str(e)
+        if not cdp:
+            return (f"Browser profile {profile!r} resolves to no CDP endpoint. Set browser.profiles.{profile} "
+                    "(or browser.cdp_url for the default profile) in config.yaml.")
+        _set_cdp_env(env, cdp)
+        return None
     # ``real_profile=False``: this route already fell back, so it stays on its fresh browser instead
     # of swapping browsers mid-task once the profile frees up.
     rp_err = _resolve_real_profile_cdp(env, force_local=local) if real_profile else None
@@ -728,12 +741,12 @@ def _own_harness_daemon(env: dict) -> Optional[bool]:
 
 
 def _route_exec(env: dict, session: str, task_id: Optional[str], local: bool, local_sidecar: bool,
-                route_key: str) -> tuple[Optional[str], bool]:
+                route_key: str, profile: str = "") -> tuple[Optional[str], bool]:
     """``_route_backend`` for one browser_exec call; returns ``(error, runs on the local sidecar)``.
     A real-profile fallback is remembered per route: the route keeps its fresh browser and the note
     waits until a result carries it (``_take_real_profile_note``)."""
     route_err = _route_backend(env, session, task_id, local, force_local_sidecar=local_sidecar,
-                               real_profile=route_key not in _real_profile_fallback)
+                               real_profile=route_key not in _real_profile_fallback, profile=profile)
     note = env.pop(_REAL_PROFILE_FALLBACK_SENTINEL, None)
     if note:
         _real_profile_fallback.setdefault(route_key, note)
@@ -741,13 +754,13 @@ def _route_exec(env: dict, session: str, task_id: Optional[str], local: bool, lo
 
 
 def _route_exec_current(env: dict, session: str, task_id: Optional[str], local: bool,
-                        local_sidecar: bool, route_key: str) -> tuple[dict, Optional[str], bool, int]:
+                        local_sidecar: bool, route_key: str, profile: str = "") -> tuple[dict, Optional[str], bool, int]:
     """``_route_exec`` on a copy of ``env`` -> ``(routed env, error, sidecar, generation)``, re-routed (at
     most 3 tries) when /browser connect published meanwhile; ``_reload_if_republished`` covers dispatch."""
     for _attempt in range(3):
         routed = dict(env)
         generation = _live_generation()
-        route_err, sidecar = _route_exec(routed, session, task_id, local, local_sidecar, route_key)
+        route_err, sidecar = _route_exec(routed, session, task_id, local, local_sidecar, route_key, profile)
         if route_err or _live_generation() == generation:
             break
     return routed, route_err, sidecar, generation
@@ -772,7 +785,7 @@ def _take_real_profile_note(route_key: str) -> dict:
 
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
-                 task_id: Optional[str] = None, local: bool = False):
+                 task_id: Optional[str] = None, local: bool = False, profile: str = ""):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
@@ -786,8 +799,15 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_error(verdict.blocked)
     # One endpoint per call: any private URL sends the whole call to the local sidecar. A call with no URL
     # literal stays on the route the previous call took.
+    profile = (profile or "").strip()
+    if profile and not _SESSION_RE.match(profile):
+        return tool_error(f"Invalid profile name {profile!r}: use 1-64 letters, digits, dashes, or underscores.")
     route_key = _backend_cache_key(task_id, session)
+    if profile:  # LOCAL CARRY: route memory (sidecar, real-profile fallback) is per browser identity
+        route_key = f"{route_key}::profile:{profile}"
     local_sidecar = verdict.local_sidecar if _URL_RE.search(code) else _exec_route_is_sidecar.get(route_key, False)
+    if profile:  # a named profile IS the endpoint: never divert it to the hybrid local sidecar
+        local_sidecar = False
 
     cmd = _find_cli()
     if not cmd:
@@ -800,8 +820,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
                               "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
+    # LOCAL CARRY: a harness daemon caches the endpoint it started with, so a daemon name is never shared
+    # across profiles; reusing one would silently drive the PREVIOUS profile's browser.
+    if profile:
+        env["BU_NAME"] = f"{session}-profile-{profile}" if session else f"profile-{profile}"
     env, route_err, local_sidecar, generation = _route_exec_current(
-        env, session, task_id, bool(local), local_sidecar, route_key)
+        env, session, task_id, bool(local), local_sidecar, route_key, profile)
     if route_err:
         return tool_error(route_err)
     if local_sidecar:
@@ -997,6 +1021,7 @@ BROWSER_EXEC_SCHEMA = {
         "properties": {
             "code": {"type": "string", "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."},
             "session": {"type": "string", "description": "Named isolated browser session — its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
+            "profile": {"type": "string", "description": "Named browser identity from config `browser.profiles` (e.g. the user's own logged-in Chrome vs the agent's). Binds this call to that profile's CDP endpoint; reuse the same name on every related call. Omit for the default browser. An unknown name is an error — it never silently falls back to the default."},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
                           "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
         },
@@ -1027,7 +1052,7 @@ def _handle_browser_exec(args: dict, **kw):
         return record_browser_call(lambda: browser_exec(
             code=args.get("code", ""), session=args.get("session", "") or "",
             timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
-            local=bool(args.get("local", False)),
+            local=bool(args.get("local", False)), profile=args.get("profile", "") or "",
         ), lambda: browser_backend_name(local_engine=_exec_local_engine.get()))
     finally:
         _exec_local_engine.reset(token)
